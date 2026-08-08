@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-line-hairline;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-obsidian text-ink-primary antialiased;
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: rgba(47, 230, 255, 0.24);
+    color: #eafcff;
+  }
+
+  /* Command-console scrollbars */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(148, 163, 184, 0.28);
+  }
+
+  /* Visible keyboard focus — accessibility floor, styled to brand */
+  :focus-visible {
+    outline: 2px solid theme("colors.cyan.DEFAULT");
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  /* Base technical-grid backdrop used behind the app shell */
+  .bg-command-grid {
+    background-color: theme("colors.obsidian.DEFAULT");
+    background-image: theme("backgroundImage.grid-fine");
+    background-size: theme("backgroundSize.grid");
+    background-position: center top;
+  }
+
+  /* Restrained glass panel — the core surface of the design system */
+  .panel {
+    @apply relative rounded-md border border-line-subtle bg-graphite/70 shadow-panel;
+    backdrop-filter: blur(14px);
+  }
+
+  .panel-raised {
+    @apply relative rounded-md border border-line-subtle bg-graphite-raised/80 shadow-panel;
+    backdrop-filter: blur(14px);
+  }
+
+  /* Eyebrow / overline label style used across the console */
+  .label-overline {
+    @apply font-mono text-2xs uppercase tracking-widest2 text-ink-tertiary;
+  }
+
+  .divider-hairline {
+    @apply h-px w-full bg-line-hairline;
+  }
+}
+
+@layer utilities {
+  .text-glow-cyan {
+    text-shadow: 0 0 18px rgba(47, 230, 255, 0.35);
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
