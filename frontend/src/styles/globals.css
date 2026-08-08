@@ -99,3 +99,12 @@
     scrollbar-width: none;
   }
 }
+
+@media print {
+  html, body { background: #fff !important; color: #111827 !important; }
+  .print-hidden { display: none !important; }
+  .assessment-report { max-width: none !important; padding: 24px !important; color: #111827 !important; }
+  .assessment-report .panel, .assessment-report .panel-raised { background: #fff !important; box-shadow: none !important; border-color: #cbd5e1 !important; break-inside: avoid; }
+  .assessment-report .text-ink-primary, .assessment-report .text-ink-secondary, .assessment-report .text-ink-tertiary, .assessment-report .text-ink-disabled { color: #111827 !important; }
+  .assessment-report .text-cyan, .assessment-report .text-violet { color: #0f766e !important; }
+}

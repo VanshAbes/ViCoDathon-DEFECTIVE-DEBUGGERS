@@ -19,7 +19,7 @@ import type { CurriculumCoverage, CurriculumDayState } from "@/types/curriculumC
  */
 export function CurriculumMap({
   coverage,
-  isMock = true,
+  isMock = false,
 }: {
   coverage: CurriculumCoverage;
   isMock?: boolean;

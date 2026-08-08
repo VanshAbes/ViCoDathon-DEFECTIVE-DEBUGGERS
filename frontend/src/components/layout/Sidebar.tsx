@@ -10,7 +10,7 @@ const navItems = [
 
 export function Sidebar() {
   return (
-    <aside className="flex h-screen w-60 shrink-0 flex-col border-r border-line-hairline bg-obsidian-shell/60 px-3 py-4">
+    <aside className="print-hidden hidden h-screen w-60 shrink-0 flex-col border-r border-line-hairline bg-obsidian-shell/60 px-3 py-4 md:flex">
       <div className="px-2 pb-6">
         <Logo />
       </div>

@@ -47,3 +47,11 @@ export interface InterviewMessage {
 }
 
 export type InterviewSessionStatus = "idle" | "live" | "complete" | "error";
+
+/** UI activity is independent of transport so mock and API sessions render the same way. */
+export type InterviewActivity = "idle" | "starting" | "waiting" | "generating";
+
+export interface InterviewSessionError {
+  message: string;
+  retryable: boolean;
+}

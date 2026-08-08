@@ -3,9 +3,15 @@ import { Panel, PanelHeader, PanelBody } from "@/components/ui/Panel";
 import { MissionGrid, MissionGridLegend } from "@/components/candidates/MissionGrid";
 import { SignalMeter } from "@/components/candidates/SignalMeter";
 import { ReadinessBadge } from "@/components/candidates/ReadinessBadge";
+import { CompetencyPanel } from "@/components/competency/CompetencyPanel";
 import type { CandidateWithScore } from "@/hooks/useCandidates";
+import type { CompetencySignal } from "@/types/competency";
 
-export function CandidateDossier({ candidate, scorecard }: CandidateWithScore) {
+export function CandidateDossier({
+  candidate,
+  scorecard,
+  competencySignals,
+}: CandidateWithScore & { competencySignals: CompetencySignal[] }) {
   const { member } = candidate;
 
   return (
@@ -28,6 +34,8 @@ export function CandidateDossier({ candidate, scorecard }: CandidateWithScore) {
           <ReadinessBadge index={scorecard.readinessIndex} />
         </div>
       </Panel>
+
+      <CompetencyPanel signals={competencySignals} isMock={false} />
 
       <Panel>
         <PanelHeader eyebrow="Cohort Signals" title="Program Performance" />

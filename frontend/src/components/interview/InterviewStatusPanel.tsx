@@ -81,7 +81,7 @@ export function InterviewStatusPanel({
         </PanelBody>
       </Panel>
 
-      <CurriculumMap coverage={curriculumCoverage} />
+      <CurriculumMap coverage={curriculumCoverage} isMock={false} />
 
       <Panel className="mt-auto p-4">
         <div className="label-overline">Session</div>
