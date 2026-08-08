@@ -23,6 +23,12 @@ export function useInterviewSession(candidate: Candidate) {
   const [feedback, setFeedback] = useState<InterviewFeedback | undefined>();
   const [isAgentTyping, setIsAgentTyping] = useState(false);
   const turnIndex = useRef(0);
+  // Guards against React StrictMode's dev-only double-invoke of mount effects:
+  // two synchronous calls to `start()` would otherwise both read the same
+  // stale `status === "idle"` closure (before either state update flushes)
+  // and each schedule a welcome message, producing a duplicate. A ref is
+  // checked/set synchronously, unlike state, so it survives the double call.
+  const hasStarted = useRef(false);
 
   const pushMessage = useCallback((role: InterviewMessage["role"], content: string) => {
     setMessages((prev) => [
@@ -32,7 +38,8 @@ export function useInterviewSession(candidate: Candidate) {
   }, []);
 
   const start = useCallback(() => {
-    if (status !== "idle") return;
+    if (hasStarted.current) return;
+    hasStarted.current = true;
     setStatus("live");
     setIsAgentTyping(true);
 
@@ -44,7 +51,7 @@ export function useInterviewSession(candidate: Candidate) {
       );
       setIsAgentTyping(false);
     }, 900);
-  }, [candidate, pushMessage, status]);
+  }, [candidate, pushMessage]);
 
   const sendTurn = useCallback(
     (message: string) => {

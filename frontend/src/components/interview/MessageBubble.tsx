@@ -2,49 +2,42 @@ import type { InterviewMessage } from "@/types/interview";
 import { formatTimestamp } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
+/**
+ * Renders a single interview transcript entry. Deliberately styled as a
+ * technical transcript (mono role label + accent rule) rather than a
+ * chat-app bubble/avatar pair — both roles left-aligned, distinguished by
+ * color and label only.
+ */
 export function MessageBubble({ message }: { message: InterviewMessage }) {
   const isAgent = message.role === "agent";
 
   return (
-    <div className={cn("flex animate-fade-up gap-3", isAgent ? "flex-row" : "flex-row-reverse")}>
-      <div
-        className={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border font-mono text-[10px] font-semibold",
-          isAgent ? "border-cyan/30 bg-cyan-dim text-cyan" : "border-violet/30 bg-violet-dim text-violet-soft"
-        )}
-      >
-        {isAgent ? "AI" : "YOU"}
-      </div>
-
-      <div className={cn("max-w-[70%] space-y-1", isAgent ? "items-start" : "items-end")}>
-        <div
+    <div className={cn("animate-fade-up border-l-2 py-0.5 pl-3.5", isAgent ? "border-cyan/40" : "border-violet/40")}>
+      <div className="flex items-baseline gap-2.5">
+        <span
           className={cn(
-            "rounded-md border px-3.5 py-2.5 text-sm leading-relaxed",
-            isAgent
-              ? "border-line-subtle bg-graphite text-ink-primary"
-              : "border-cyan/20 bg-cyan-dim text-ink-primary"
+            "font-mono text-2xs font-semibold uppercase tracking-widest2",
+            isAgent ? "text-cyan" : "text-violet-soft"
           )}
         >
-          {message.content}
-        </div>
-        <div className={cn("font-mono text-2xs text-ink-disabled", isAgent ? "text-left" : "text-right")}>
-          {formatTimestamp(message.timestamp)}
-        </div>
+          {isAgent ? "AI Interviewer" : "Your Response"}
+        </span>
+        <span className="font-mono text-2xs text-ink-disabled">{formatTimestamp(message.timestamp)}</span>
       </div>
+      <p className="mt-1 max-w-2xl text-sm leading-relaxed text-ink-primary">{message.content}</p>
     </div>
   );
 }
 
 export function TypingIndicator() {
   return (
-    <div className="flex animate-fade-up items-center gap-3">
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-cyan/30 bg-cyan-dim font-mono text-[10px] font-semibold text-cyan">
-        AI
+    <div className="animate-fade-up border-l-2 border-cyan/40 py-0.5 pl-3.5">
+      <div className="flex items-baseline gap-2.5">
+        <span className="font-mono text-2xs font-semibold uppercase tracking-widest2 text-cyan">AI Interviewer</span>
       </div>
-      <div className="flex items-center gap-1 rounded-md border border-line-subtle bg-graphite px-3.5 py-3">
-        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-tertiary [animation-delay:-0.2s]" />
-        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-tertiary [animation-delay:-0.1s]" />
-        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-tertiary" />
+      <div className="mt-1 flex items-center gap-2">
+        <span className="font-mono text-sm text-ink-tertiary">Formulating question</span>
+        <span className="h-3.5 w-[2px] animate-blink bg-cyan" />
       </div>
     </div>
   );

@@ -9,7 +9,7 @@ export function CandidateDossier({ candidate, scorecard }: CandidateWithScore) {
   const { member } = candidate;
 
   return (
-    <div className="flex h-full w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-line-hairline p-4">
+    <div className="flex h-full w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l border-line-hairline p-4">
       <Panel className="p-4">
         <div className="flex items-center gap-3">
           <Avatar name={member.name} size="lg" />

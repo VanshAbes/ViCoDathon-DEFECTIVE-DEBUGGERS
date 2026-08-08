@@ -26,22 +26,23 @@ export function MessageComposer({
 
   return (
     <div className="border-t border-line-hairline p-4">
-      <div className="flex items-end gap-3 rounded-md border border-line-subtle bg-graphite p-2 focus-within:border-cyan/50">
+      <div className="label-overline mb-2">Your Response</div>
+      <div className="flex items-end gap-3 rounded-md border border-line-subtle bg-graphite p-2.5 transition-colors focus-within:border-cyan/60 focus-within:shadow-glow">
         <textarea
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={disabled}
-          rows={1}
-          placeholder={disabled ? "Interview complete." : "Type your response…"}
-          className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm text-ink-primary placeholder:text-ink-tertiary outline-none disabled:opacity-40"
+          rows={3}
+          placeholder={disabled ? "Waiting…" : "Compose your response…"}
+          className="max-h-48 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-ink-primary placeholder:text-ink-tertiary outline-none disabled:opacity-40"
         />
         <Button variant="primary" size="md" onClick={submit} disabled={disabled || !value.trim()}>
-          Send
+          Submit Answer
         </Button>
       </div>
       <div className="mt-1.5 px-1 font-mono text-2xs text-ink-disabled">
-        Enter to send · Shift + Enter for a new line
+        Enter to submit · Shift + Enter for a new line
       </div>
     </div>
   );
