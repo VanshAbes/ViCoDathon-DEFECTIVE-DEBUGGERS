@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/Button";
 export function MessageComposer({ onSend, disabled, activity = "idle" }: {
   onSend: (message: string) => void;
   disabled?: boolean;
-  activity?: "idle" | "starting" | "waiting" | "generating";
+  activity?: "idle" | "starting" | "submitting" | "waiting" | "generating";
 }) {
   const [value, setValue] = useState("");
   const submit = () => {
@@ -30,7 +30,7 @@ export function MessageComposer({ onSend, disabled, activity = "idle" }: {
         disabled={disabled} rows={3} aria-label="Interview response" placeholder={placeholder}
         className="max-h-48 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-ink-primary placeholder:text-ink-tertiary outline-none disabled:opacity-40" />
       <Button variant="primary" size="md" onClick={submit} disabled={disabled || !value.trim()}>
-        {activity === "waiting" ? "Sending…" : "Submit Answer"}
+        {activity === "submitting" ? "Sending…" : "Submit Answer"}
       </Button>
     </div>
     <div className="mt-1.5 px-1 font-mono text-2xs text-ink-disabled">Enter to submit · Shift + Enter for a new line</div>

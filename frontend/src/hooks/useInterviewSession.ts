@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { Candidate } from "@/types/candidate";
 import type { InterviewActivity, InterviewMessage, InterviewSessionError, InterviewSessionStatus, InterviewFeedback } from "@/types/interview";
 import { MOCK_AGENT_SCRIPT, MOCK_CLOSING_REPLY, buildMockFeedback } from "@/data/mockInterviewScript";
@@ -49,8 +49,6 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
     timers.current.push(timer);
   }, []);
 
-  useEffect(() => () => timers.current.forEach((timer) => window.clearTimeout(timer)), []);
-
   const fail = useCallback((reason: unknown) => {
     const message = reason instanceof InterviewApiError ? reason.message : "The interview session could not continue.";
     setError({ message, retryable: true });
@@ -100,7 +98,7 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
       if (status !== "live" || !message.trim()) return;
       pushMessage("candidate", message.trim());
       setIsAgentTyping(true);
-      setActivity("waiting");
+      setActivity("submitting");
 
       if (source === "api") {
         void postInterview({ sessionId, message: message.trim() }).then(applyApiResponse).catch(fail);
@@ -120,6 +118,7 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
         } else {
           pushMessage("agent", MOCK_AGENT_SCRIPT[nextIndex]!);
           turnIndex.current += 1;
+          setActivity("waiting");
         }
         setIsAgentTyping(false);
       }, 1100);
