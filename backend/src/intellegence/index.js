@@ -11,6 +11,7 @@ const curriculumModel = require('../models/curriculumModel');
 const candidateIntelligence = require('./candidateIntelligence');
 const curriculumIntelligence = require('./curriculumIntelligence');
 const probingEngine = require('./probingEngine');
+const candidateProfileEngine = require('./candidateProfileEngine');
 
 module.exports = {
   // raw lookups
@@ -43,4 +44,7 @@ module.exports = {
   // convenience bundles
   getLearningSignals: candidateIntelligence.getLearningSignals,
   getCandidateSummary: candidateIntelligence.getCandidateSummary,
+
+  // Candidate Intelligence Engine: full structured, deterministic profile
+  buildCandidateProfile: candidateProfileEngine.buildCandidateProfile,
 };
