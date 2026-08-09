@@ -27,7 +27,7 @@ export function InterviewPage() {
 function InterviewConsole({ entry, scrollRef }: { entry: NonNullable<ReturnType<typeof useCandidate>>; scrollRef: RefObject<HTMLDivElement> }) {
   const { candidate, scorecard } = entry;
   const navigate = useNavigate();
-  const session = useInterviewSession(candidate);
+  const session = useInterviewSession(candidate, "api");
   const { status, messages, isAgentTyping, sessionId, turnsCompleted, turnsTotal, activity, error, feedback, source, start, sendTurn } = session;
   const curriculumCoverage = useMockCurriculumCoverage(status, turnsCompleted, turnsTotal);
   const competencySignals = useMockCompetencySignals(messages, curriculumCoverage);

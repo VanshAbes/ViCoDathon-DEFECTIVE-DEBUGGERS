@@ -443,21 +443,112 @@ function decideNextQuestion(session) {
 // ---------------------------------------------------------------------
 
 /**
- * Deterministic, content-agnostic fallback question text — used only
- * when the LLM call fails or returns empty, so the interview keeps
- * moving instead of crashing (same "structural safety net" philosophy
- * as answerEvaluator.js's fallback path).
- * @param {object} decision
+ * Deterministic fallback question text — used only when the LLM call fails
+ * or returns empty, so the interview keeps moving instead of crashing
+ * (same "structural safety net" philosophy as answerEvaluator.js's
+ * fallback path).
+ *
+ * Unlike the LLM path (which receives full history via
+ * prompts.buildQuestionMessages), this fallback must generate a sensible
+ * question with NO external model. To avoid the previous bug where it
+ * merely rephrased the current question verbatim, it:
+ *   - varies by `decision.questionType` (challenge vs clarification vs
+ *     cross_topic vs baseline/probe), so different intents ask different
+ *     things;
+ *   - inspects the real previous question from `session.questions` and
+ *     refuses to return the same text or near-verbatim rephrase;
+ *   - if the first-chosen wording overlaps too heavily with the previous
+ *     question, pivots to a different information demand.
+ *
+ * @param {object} decision - planner decision (see generateNextQuestion)
+ * @param {import('./sessionModel').SessionState} session - for history/novelty
  * @returns {string}
  */
-function buildFallbackQuestionText(decision) {
-  if (decision.day === null || decision.day === undefined) {
-    return "Looking back at the cohort, what part are you proudest of, and why?";
+function buildFallbackQuestionText(decision, session) {
+  const topic = decision.topic || 'that topic';
+  const dayLabel = decision.day === null || decision.day === undefined ? '' : `Day ${decision.day}`;
+
+  // The most recent question actually asked, for novelty protection.
+  const history = session ? session.questions : [];
+  const lastAsked = history.length ? history[history.length - 1].question : null;
+
+  // Simple token set for overlap detection (avoid near-verbatim rephrase).
+  const tokens = (text) => {
+    const set = new Set();
+    for (const t of (text || '').toLowerCase().match(/[a-z0-9']+/g) || []) {
+      if (t.length >= 4) set.add(t);
+    }
+    return set;
+  };
+  const overlapRatio = (a, b) => {
+    const sa = tokens(a);
+    const sb = tokens(b);
+    if (sa.size === 0 || sb.size === 0) return 0;
+    let shared = 0;
+    for (const t of sa) if (sb.has(t)) shared += 1;
+    return shared / Math.min(sa.size, sb.size);
+  };
+
+  // Candidate fallback phrasings, keyed by information demand. Each is a
+  // function(dayLabel, topic) -> question. The richer, more specific ones
+  // are tried first for follow-ups so a DEPTH question genuinely pushes
+  // for new information rather than re-asking the opener.
+  const demands = {
+    challenge: [
+      (d, t) => `On ${d} (${t}), what's the most common edge case or failure mode, and how would you mitigate it in practice?`,
+      (d, t) => `Thinking about ${d} (${t}) — walk me through a real trade-off or limitation you'd hit, and how you'd decide.`,
+      (d, t) => `For ${d} (${t}), consider a tricky boundary condition. How would you diagnose it and what would you change first?`,
+    ],
+    clarification: [
+      (d, t) => `You mentioned ${d} (${t}) — could you go deeper and show the concrete step you'd take, and what you'd check to know it worked?`,
+      (d, t) => `Let's tighten up ${d} (${t}): describe the key mechanism in a way that shows you can apply it, not just name it.`,
+    ],
+    cross_topic: [
+      (d, t) => `Let's move on to ${d} (${t}). Can you walk me through how you'd approach it?`,
+      (d, t) => `Shifting to a new area — ${d} (${t}). How would you get started on it in practice?`,
+    ],
+    baseline: [
+      (d, t) => `Let's talk about ${d} (${t}). Can you walk me through how you'd approach it?`,
+      (d, t) => `Starting with ${d} (${t}) — how would you go about it in a real project?`,
+    ],
+    probe: [
+      (d, t) => `On ${d} (${t}), what's your practical approach?`,
+      (d, t) => `Let's look at ${d} (${t}). Walk me through how you'd handle it end to end.`,
+    ],
+  };
+
+  // Closing / non-day questions.
+  const closing = () => "Looking back at the cohort, what part are you proudest of, and why?";
+
+  const pickDemand = () => {
+    const type = decision.questionType;
+    let list = demands[type] || (decision.isFollowUp ? demands.challenge : demands.baseline);
+    // For a follow-up without an explicit challenge/clarification type,
+    // fall back to a challenge-style demand to force new information.
+    if (decision.isFollowUp && !['challenge', 'clarification', 'cross_topic'].includes(type)) {
+      list = demands.challenge;
+    }
+    return list;
+  };
+
+  const candidates = pickDemand();
+
+  // Try each candidate; accept the first that is not identical to and does
+  // not heavily overlap the previous question. If none pass, fall back to
+  // the last candidate (best effort — still distinct by construction from
+  // the opener for follow-ups).
+  for (let i = 0; i < candidates.length; i += 1) {
+    const text = candidates[i](dayLabel, topic);
+    if (!lastAsked) return text; // no history -> safe to use the first
+    if (text.trim().toLowerCase() === lastAsked.trim().toLowerCase()) continue;
+    if (overlapRatio(text, lastAsked) > 0.75) continue;
+    return text;
   }
-  if (decision.isFollowUp) {
-    return `Could you say a bit more about Day ${decision.day} (${decision.topic || 'that topic'}) — specifically, how would you approach it in practice?`;
-  }
-  return `Let's talk about Day ${decision.day} (${decision.topic || 'that topic'}). Can you walk me through how you'd approach it?`;
+
+  // Last resort: a generic-but-distinct closing/probing question.
+  return decision.day === null || decision.day === undefined
+    ? closing()
+    : `Outside of the basics, what about Day ${decision.day} (${topic}) do you think is hardest to get right?`;
 }
 
 /**
@@ -510,8 +601,9 @@ async function generateNextQuestion(session, options = {}) {
   } catch (_err) {
     questionText = ''; // LLM failure -> fall through to the deterministic fallback below
   }
+
   questionText = (questionText || '').trim();
-  if (!questionText) questionText = buildFallbackQuestionText(decision);
+  if (!questionText) questionText = buildFallbackQuestionText(decision, session);
 
   return {
     question: questionText,

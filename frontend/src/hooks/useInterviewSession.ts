@@ -5,17 +5,19 @@ import { MOCK_AGENT_SCRIPT, MOCK_CLOSING_REPLY, buildMockFeedback } from "@/data
 import { shortId } from "@/lib/format";
 import { InterviewApiError, postInterview } from "@/lib/interviewApi";
 
+const DEFAULT_MIN_API_TURNS = 8;
+
 /**
  * Drives the interview console's conversation state.
  *
- * IMPORTANT — this is a local mock. It reproduces the request/response shape
- * of `POST /api/interview` from `technical-spec.md` so the eventual API
- * integration is a swap of `sendTurn` internals only:
+ * Supports two transports:
+ *   - source="api":  calls the real backend via `postInterview()`.
+ *        start:  POST /api/interview { sessionId, candidate }  -> { reply, done, questionNumber? }
+ *        turn:   POST /api/interview { sessionId, message }    -> { reply, done, questionNumber?, feedback? }
+ *   - source="mock": local, deterministic script (kept as a fallback).
  *
- *   start:  POST /api/interview { sessionId, candidate }        -> { reply, done }
- *   turn:   POST /api/interview { sessionId, message }          -> { reply, done, feedback? }
- *
- * No network calls happen here yet, per scope.
+ * The single `sessionId` is generated once and reused for every request so
+ * the backend's in-memory store keeps this session's continuity.
  */
 export function useInterviewSession(candidate: Candidate, source: "mock" | "api" = "mock") {
   const [sessionId] = useState(() => shortId("sess"));
@@ -25,6 +27,7 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
   const [isAgentTyping, setIsAgentTyping] = useState(false);
   const [activity, setActivity] = useState<InterviewActivity>("idle");
   const [error, setError] = useState<InterviewSessionError | undefined>();
+  const [questionNumber, setQuestionNumber] = useState(0);
   const turnIndex = useRef(0);
   const timers = useRef<number[]>([]);
   // Guards against React StrictMode's dev-only double-invoke of mount effects:
@@ -57,17 +60,21 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
     setActivity("idle");
   }, []);
 
-  const applyApiResponse = useCallback((response: { reply: string; done: boolean; feedback?: InterviewFeedback }) => {
-    pushMessage("agent", response.reply);
-    if (response.feedback) setFeedback(response.feedback);
-    setIsAgentTyping(false);
-    if (response.done) {
-      setActivity("generating");
-      setStatus("complete");
-    } else {
-      setActivity("waiting");
-    }
-  }, [pushMessage]);
+  const applyApiResponse = useCallback(
+    (response: { reply: string; done: boolean; questionNumber?: number; feedback?: InterviewFeedback }) => {
+      pushMessage("agent", response.reply);
+      if (typeof response.questionNumber === "number") setQuestionNumber(response.questionNumber);
+      if (response.feedback) setFeedback(response.feedback);
+      setIsAgentTyping(false);
+      if (response.done) {
+        setActivity("generating");
+        setStatus("complete");
+      } else {
+        setActivity("waiting");
+      }
+    },
+    [pushMessage]
+  );
 
   const start = useCallback(() => {
     if (hasStarted.current) return;
@@ -82,7 +89,7 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
       return;
     }
 
-    // TODO(api): replace with POST /api/interview { sessionId, candidate }
+    // Mock path: seeded welcome message.
     schedule(() => {
       pushMessage(
         "agent",
@@ -105,7 +112,7 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
         return;
       }
 
-      // TODO(api): replace with POST /api/interview { sessionId, message }
+      // Mock path: step through the deterministic script.
       schedule(() => {
         const nextIndex = turnIndex.current;
         const isLastTurn = nextIndex >= MOCK_AGENT_SCRIPT.length;
@@ -126,8 +133,10 @@ export function useInterviewSession(candidate: Candidate, source: "mock" | "api"
     [applyApiResponse, candidate.member.jobRole, fail, pushMessage, schedule, sessionId, source, status]
   );
 
-  const turnsTotal = MOCK_AGENT_SCRIPT.length + 1;
-  const turnsCompleted = Math.min(turnIndex.current, MOCK_AGENT_SCRIPT.length);
+  // Progress counters. In API mode the backend drives the count via its
+  // `questionNumber`; in mock mode we use the fixed mock script length.
+  const turnsTotal = source === "api" ? Math.max(DEFAULT_MIN_API_TURNS, questionNumber) : MOCK_AGENT_SCRIPT.length + 1;
+  const turnsCompleted = source === "api" ? questionNumber : Math.min(turnIndex.current, MOCK_AGENT_SCRIPT.length);
 
   return {
     sessionId,

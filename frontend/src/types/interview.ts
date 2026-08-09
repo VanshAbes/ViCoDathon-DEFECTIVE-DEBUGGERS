@@ -35,6 +35,8 @@ export interface InterviewFeedback {
 export interface InterviewResponse {
   reply: string;
   done: boolean;
+  /** Present in backend responses — tracks the number of questions asked so far. */
+  questionNumber?: number;
   feedback?: InterviewFeedback;
 }
 

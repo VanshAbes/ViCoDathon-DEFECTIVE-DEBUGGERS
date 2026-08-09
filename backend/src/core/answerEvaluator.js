@@ -28,10 +28,161 @@
  * only the parsed, sanitized structured fields.
  */
 
-const { getDayByNumber } = require('../models/curriculumModel');
+const { getDayByNumber, getModuleForDay } = require('../models/curriculumModel');
 const { buildEvaluationMessages } = require('../llm/prompts');
 const llmClient = require('../llm/llmClient');
 const sessionModel = require('./sessionModel');
+
+// ---------------------------------------------------------------------
+// Deterministic local evaluator (no-LLM fallback)
+// ---------------------------------------------------------------------
+// Used ONLY when the LLM transport is unavailable (e.g. no LLM_API_KEY,
+// provider error, network failure). It never sees an API key and never
+// makes a network call. It produces the SAME AnswerEvaluation shape the
+// LLM path returns, grounded entirely in real, existing interview
+// context: the curriculum day's objectives/title/tools, the question
+// actually asked, the candidate's raw answer text, the candidate's
+// recommended difficulty, and prior session signals. It deliberately
+// does NOT return a constant score — it distinguishes shallow, partial,
+// reasonable, and strong answers so the question planner can adapt.
+
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'if', 'of', 'to', 'in', 'on', 'for', 'with',
+  'that', 'this', 'these', 'those', 'it', 'is', 'are', 'was', 'were', 'be', 'been',
+  'i', 'you', 'we', 'they', 'he', 'she', 'my', 'your', 'our', 'their', 'me', 'us',
+  'do', 'did', 'does', 'have', 'has', 'had', 'will', 'would', 'can', 'could', 'should',
+  'not', 'so', 'as', 'at', 'by', 'from', 'about', 'into', 'over', 'after', 'before',
+  'then', 'than', 'there', 'here', 'when', 'where', 'which', 'who', 'whom', 'what',
+  'how', 'why', 'very', 'just', 'really', 'also', 'too', 'up', 'out', 'own', 'same',
+  'one', 'two', 'first', 'like', 'lot', 'bit', 'get', 'got', 'use', 'used', 'using',
+]);
+
+/** Splits text into lowercased, alphanumeric tokens. */
+function tokenize(text) {
+  return (text || '').toLowerCase().match(/[a-z0-9]+/g) || [];
+}
+
+/** @returns {string[]} significant (non-stopword, len>=3) tokens. */
+function significantTokens(text) {
+  return tokenize(text).filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+}
+
+/**
+ * Builds the set of significant curriculum terms the evaluator should
+ * look for in an answer: the day's title, objectives, tools, and module.
+ * @param {number|null} day
+ * @param {string[]} objectives
+ * @returns {string[]}
+ */
+function curriculumTermsFor(day, objectives) {
+  const dayRec = typeof day === 'number' ? getDayByNumber(day) : null;
+  const mod = typeof day === 'number' ? getModuleForDay(day) : null;
+  const sources = [
+    dayRec ? dayRec.title : '',
+    ...(dayRec ? dayRec.tools : []),
+    ...objectives,
+    mod ? mod.title : '',
+  ];
+  const terms = new Set();
+  for (const src of sources) {
+    for (const t of significantTokens(src)) terms.add(t);
+  }
+  return Array.from(terms);
+}
+
+/**
+ * Deterministically evaluates one answer against its curriculum context.
+ * Score is 0–5, built from:
+ *   - concept coverage (how many distinct curriculum terms appear)
+ *   - answer substance (word count / sentence depth)
+ *   - a small depth bonus for a long, concept-rich answer
+ * It is NOT constant: an empty/generic answer scores low, a concise but
+ * on-topic answer scores moderate, and a detailed, concept-rich answer
+ * scores high.
+ *
+ * @param {import('./sessionModel').SessionState} session
+ * @param {{ id:string, day:number|null, title:string|null, question:string, isFollowUp:boolean }} question
+ * @param {string} answerText
+ * @param {string[]} objectives
+ * @returns {import('./answerEvaluator').AnswerEvaluation}
+ */
+function deterministicEvaluate(session, question, answerText, objectives) {
+  const text = (answerText || '').trim();
+  const words = tokenize(text);
+  const wordCount = words.length;
+
+  const terms = curriculumTermsFor(question.day, objectives);
+  const answerSig = new Set(significantTokens(text));
+  const matchedTerms = terms.filter((t) => answerSig.has(t));
+  const distinctHits = matchedTerms.length;
+
+  // --- substance (0..2) ---
+  const substance = wordCount >= 30 ? 2 : wordCount >= 12 ? 1 : 0;
+
+  // --- concept coverage (0..2) ---
+  const concept = distinctHits >= 3 ? 2 : distinctHits >= 1 ? 1 : 0;
+
+  // --- depth bonus (0..1) ---
+  const sentences = (text.match(/[.!?]+/g) || []).length;
+  const depth = wordCount >= 40 && distinctHits >= 2 && sentences >= 2 ? 1 : 0;
+
+  let score = substance + concept + depth; // 0..5
+  score = clampScore(score);
+
+  // ---- recommended action (reuse existing deterministic logic) ----
+  const priorSignal = question.day !== null ? session.competencySignals.get(question.day) : null;
+  const repeatedStruggle = Boolean(priorSignal && priorSignal.attempts >= 1 && priorSignal.lastShallow);
+  const meetsMinimums = sessionModel.meetsCompletionCriteria(session);
+
+  let recommendedAction = fallbackRecommendedAction({ score, repeatedStruggle, meetsMinimums });
+  if (
+    repeatedStruggle &&
+    (recommendedAction === RECOMMENDED_ACTIONS.FOLLOW_UP || recommendedAction === RECOMMENDED_ACTIONS.CLARIFY)
+  ) {
+    recommendedAction = RECOMMENDED_ACTIONS.CHANGE_TOPIC;
+  }
+
+  // ---- strengths / gaps / evidence (short, grounded phrases) ----
+  const topicLabel = question.title || `this day's topic`;
+  const strengths = [];
+  const gaps = [];
+  const evidence = [];
+
+  if (distinctHits >= 3) {
+    strengths.push(`Referenced specific curriculum concepts for ${topicLabel}.`);
+  } else if (distinctHits >= 1) {
+    strengths.push(`Touched on at least one relevant concept for ${topicLabel}.`);
+  }
+
+  if (wordCount >= 12) {
+    strengths.push('Provided a substantive, multi-word answer.');
+  }
+
+  if (wordCount < 12) {
+    gaps.push('Answer was too brief to demonstrate technical depth.');
+  }
+  if (distinctHits === 0) {
+    gaps.push('Did not reference any of the specific concepts the question was probing.');
+  }
+  if (sentences < 2 && wordCount >= 12) {
+    gaps.push('Answer lacked structure or a clear explanation.');
+  }
+
+  evidence.push(
+    distinctHits > 0
+      ? `Answer referenced ${distinctHits} concept term(s) from the day's objectives.`
+      : 'Answer was general and did not mention specific curriculum concepts.'
+  );
+
+  // ---- competency updates (same shape as the LLM structural fallback) ----
+  const competencyUpdates = coerceCompetencyUpdates(
+    null,
+    question,
+    score
+  );
+
+  return { score, strengths, gaps, evidence, competencyUpdates, recommendedAction };
+}
 
 /** The only six values recommendedAction is allowed to take. */
 const RECOMMENDED_ACTIONS = Object.freeze({
@@ -178,7 +329,18 @@ async function evaluateAnswer(session, input, options = {}) {
 
   const messages = buildEvaluationMessages(session, question, input.answer, objectives);
   const completeFn = options.completeFn || llmClient.complete;
-  const raw = await completeFn(messages, { maxTokens: 700, temperature: 0.3 });
+
+  let raw;
+  try {
+    raw = await completeFn(messages, { maxTokens: 700, temperature: 0.3 });
+  } catch (_err) {
+    // LLM transport unavailable (no API key, provider error, network
+    // failure, or a stub that throws). Fall back to the fully
+    // deterministic local evaluator so the interview keeps working in
+    // environments with no external LLM. The existing LLM path is
+    // completely unchanged when completeFn succeeds.
+    return deterministicEvaluate(session, question, input.answer, objectives);
+  }
 
   let parsed = null;
   try {
@@ -253,4 +415,7 @@ module.exports = {
   coerceStringArray,
   coerceCompetencyUpdates,
   fallbackRecommendedAction,
+  // exported for the no-LLM deterministic fallback (tests + transparency)
+  deterministicEvaluate,
+  curriculumTermsFor,
 };
