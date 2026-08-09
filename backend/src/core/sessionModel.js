@@ -60,7 +60,7 @@ const PHASE_ORDER = [
  * @type {Record<string, string[]>}
  */
 const ALLOWED_TRANSITIONS = {
-  [PHASES.BASELINE]: [PHASES.PROBE],
+  [PHASES.BASELINE]: [PHASES.PROBE, PHASES.FOLLOW_UP, PHASES.CROSS_TOPIC, PHASES.DEPTH],
   [PHASES.PROBE]: [PHASES.FOLLOW_UP, PHASES.CROSS_TOPIC, PHASES.DEPTH, PHASES.PROBE, PHASES.FINAL_ASSESSMENT],
   [PHASES.FOLLOW_UP]: [PHASES.PROBE, PHASES.CROSS_TOPIC, PHASES.DEPTH, PHASES.FOLLOW_UP, PHASES.FINAL_ASSESSMENT],
   [PHASES.CROSS_TOPIC]: [PHASES.PROBE, PHASES.FOLLOW_UP, PHASES.DEPTH, PHASES.CROSS_TOPIC, PHASES.FINAL_ASSESSMENT],
@@ -81,7 +81,7 @@ const DEFAULT_MIN_DAYS_COVERED = 4;
  * @property {{role:'assistant'|'user', content:string, ts:number}[]} history
  * @property {{id:string, day:number|null, title:string|null, phase:string, question:string, isFollowUp:boolean, askedAt:number}[]} questions
  * @property {{questionId:string, day:number|null, answer:string, answeredAt:number}[]} answers
- * @property {{questionId:string, day:number|null, score:number|null, shallow:boolean, notes:string, evaluatedAt:number}[]} evaluations
+ * @property {{questionId:string, day:number|null, score:number|null, shallow:boolean, notes:string, recommendedAction:string|null, evaluatedAt:number}[]} evaluations
  * @property {Set<number>} daysCovered
  * @property {Set<string>} topicsCovered   - curriculum day titles touched
  * @property {Map<number, {attempts:number, avgScore:number, lastShallow:boolean}>} competencySignals - keyed by day
@@ -247,7 +247,12 @@ function recordAnswer(session, input) {
  * feedback generator can use it without recomputing from scratch).
  *
  * @param {SessionState} session
- * @param {{ questionId: string, score?: number|null, shallow?: boolean, notes?: string }} input
+ * @param {{ questionId: string, score?: number|null, shallow?: boolean, notes?: string, recommendedAction?: string|null }} input
+ *   `recommendedAction` (P6 answerEvaluator output, e.g. "FOLLOW_UP" | "CLARIFY" |
+ *   "INCREASE_DIFFICULTY" | "CHANGE_TOPIC" | "CROSS_CONNECT" | "COMPLETE") is optional
+ *   and stored as-is; when present, questionPlanner.js (P5) reads it to steer the
+ *   next question, taking priority over its own score-derived heuristic. Callers
+ *   that don't have an evaluator yet (or older callers) simply omit it.
  * @returns {SessionState}
  */
 function recordEvaluation(session, input) {
@@ -262,6 +267,7 @@ function recordEvaluation(session, input) {
     score: typeof input.score === 'number' ? input.score : null,
     shallow,
     notes: input.notes ?? '',
+    recommendedAction: input.recommendedAction ?? null,
     evaluatedAt: now,
   });
 

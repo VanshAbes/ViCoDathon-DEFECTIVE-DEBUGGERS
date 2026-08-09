@@ -40,12 +40,17 @@ const {
   isDayCovered,
   getUncoveredTopics,
   recommendNextPhase,
+  meetsCompletionCriteria,
 } = require('./sessionModel');
 const { getTopicsForDeeperProbing } = require('../intelligence/probingEngine');
 const { DIFFICULTY_LEVELS } = require('../intelligence/candidateProfileEngine');
 const { getModuleForDay } = require('../models/curriculumModel');
 const llmClient = require('../llm/llmClient');
 const { buildQuestionMessages } = require('../llm/prompts');
+const { RECOMMENDED_ACTIONS } = require('./answerEvaluator');
+
+/** Set of valid P6 recommendedAction values, for cheap membership checks below. */
+const VALID_RECOMMENDED_ACTIONS = new Set(Object.values(RECOMMENDED_ACTIONS));
 
 /** Supported question types (spec). */
 const QUESTION_TYPES = Object.freeze({
@@ -150,6 +155,139 @@ function lookupTopicContext(session, day) {
   return { module: mod ? mod.title : null, candidateStatus: null, attempts: null };
 }
 
+/**
+ * Translates a P6 `recommendedAction` into a concrete question decision.
+ * Returns `null` when the action isn't actionable right now (e.g. no
+ * prior question to follow up on, or COMPLETE requested before the P4
+ * minimums are met) — in that case the caller falls back to the
+ * score-based heuristic instead.
+ *
+ * @param {import('./sessionModel').SessionState} session
+ * @param {string} recommendedAction - one of RECOMMENDED_ACTIONS
+ * @param {{ lastQuestion: object|null, currentDifficulty: string, repeatedStruggle: boolean, meetsMinimums: boolean }} ctx
+ * @returns {QuestionDecision|null}
+ */
+function mapRecommendedActionToDecision(session, recommendedAction, ctx) {
+  const { lastQuestion, currentDifficulty, repeatedStruggle, meetsMinimums } = ctx;
+
+  switch (recommendedAction) {
+    case RECOMMENDED_ACTIONS.FOLLOW_UP: {
+      // A repeated struggle means we've already clarified once and it's
+      // still not landing — don't clarify a third time, let the caller's
+      // heuristic (which will route to CROSS_TOPIC) take over instead.
+      if (repeatedStruggle || !lastQuestion) return null;
+      const topicCtx = lookupTopicContext(session, lastQuestion.day);
+      return {
+        phase: PHASES.FOLLOW_UP,
+        day: lastQuestion.day,
+        topic: lastQuestion.title,
+        module: topicCtx.module,
+        candidateStatus: topicCtx.candidateStatus,
+        attempts: topicCtx.attempts,
+        questionType: QUESTION_TYPES.CLARIFICATION,
+        difficulty: stepDown(currentDifficulty),
+        isFollowUp: true,
+      };
+    }
+
+    case RECOMMENDED_ACTIONS.CLARIFY: {
+      if (repeatedStruggle || !lastQuestion) return null;
+      const topicCtx = lookupTopicContext(session, lastQuestion.day);
+      return {
+        phase: PHASES.FOLLOW_UP,
+        day: lastQuestion.day,
+        topic: lastQuestion.title,
+        module: topicCtx.module,
+        candidateStatus: topicCtx.candidateStatus,
+        attempts: topicCtx.attempts,
+        questionType: QUESTION_TYPES.CLARIFICATION,
+        // CLARIFY means "the answer was ambiguous," not "it was wrong" —
+        // keep difficulty steady rather than easing it down like FOLLOW_UP.
+        difficulty: currentDifficulty,
+        isFollowUp: true,
+      };
+    }
+
+    case RECOMMENDED_ACTIONS.INCREASE_DIFFICULTY: {
+      if (!lastQuestion) return null;
+      const harder = stepUp(currentDifficulty);
+      const topicCtx = lookupTopicContext(session, lastQuestion.day);
+      const questionType =
+        harder === 'advanced'
+          ? QUESTION_TYPES.CHALLENGE
+          : harder === 'intermediate'
+            ? QUESTION_TYPES.SCENARIO
+            : QUESTION_TYPES.ARCHITECTURE_DESIGN;
+      return {
+        phase: PHASES.DEPTH,
+        day: lastQuestion.day,
+        topic: lastQuestion.title,
+        module: topicCtx.module,
+        candidateStatus: topicCtx.candidateStatus,
+        attempts: topicCtx.attempts,
+        questionType,
+        difficulty: harder,
+        isFollowUp: false,
+      };
+    }
+
+    case RECOMMENDED_ACTIONS.CHANGE_TOPIC: {
+      const next = pickNextTopic(session);
+      return {
+        phase: PHASES.CROSS_TOPIC,
+        day: next ? next.day : null,
+        topic: next ? next.title : null,
+        module: next ? next.module : null,
+        candidateStatus: next ? next.candidateStatus : null,
+        attempts: next ? next.attempts : null,
+        questionType: QUESTION_TYPES.CROSS_TOPIC,
+        difficulty: repeatedStruggle ? stepDown(currentDifficulty) : currentDifficulty,
+        isFollowUp: false,
+      };
+    }
+
+    case RECOMMENDED_ACTIONS.CROSS_CONNECT: {
+      const next = pickNextTopic(session);
+      // Bridges the new (still-uncovered, so coverage keeps growing) topic
+      // back to the one just discussed — prompts.js uses crossConnectDay/
+      // crossConnectTopic to ask the LLM to connect the two explicitly.
+      return {
+        phase: PHASES.CROSS_TOPIC,
+        day: next ? next.day : null,
+        topic: next ? next.title : null,
+        module: next ? next.module : null,
+        candidateStatus: next ? next.candidateStatus : null,
+        attempts: next ? next.attempts : null,
+        questionType: QUESTION_TYPES.SCENARIO,
+        difficulty: currentDifficulty,
+        isFollowUp: false,
+        crossConnectDay: lastQuestion ? lastQuestion.day : null,
+        crossConnectTopic: lastQuestion ? lastQuestion.title : null,
+      };
+    }
+
+    case RECOMMENDED_ACTIONS.COMPLETE: {
+      // Only honored once the hard P4 minimums are actually met — this
+      // is a hint to wrap up, not an override of "never finish early."
+      if (!meetsMinimums) return null;
+      return {
+        phase: PHASES.FINAL_ASSESSMENT,
+        day: null,
+        topic: 'Overall reflection',
+        module: null,
+        candidateStatus: null,
+        attempts: null,
+        questionType: QUESTION_TYPES.SCENARIO,
+        difficulty: currentDifficulty,
+        isFollowUp: false,
+      };
+    }
+
+    default:
+      return null;
+  }
+}
+
 // ---------------------------------------------------------------------
 // Core decision logic
 // ---------------------------------------------------------------------
@@ -190,6 +328,12 @@ function decideNextQuestion(session) {
   if (session.phase === PHASES.COMPLETE) {
     throw new Error('decideNextQuestion: session is already COMPLETE, nothing left to ask');
   }
+  if (session.phase === PHASES.FINAL_ASSESSMENT) {
+    throw new Error(
+      'decideNextQuestion: session is already in FINAL_ASSESSMENT — the closing question has been asked; ' +
+      'record its answer and call sessionModel.setPhase(session, PHASES.COMPLETE) instead of asking another question.'
+    );
+  }
 
   const lastQuestion = session.questions[session.questions.length - 1] || null;
   const lastEvaluation = session.evaluations[session.evaluations.length - 1] || null;
@@ -220,6 +364,26 @@ function decideNextQuestion(session) {
   // of looping unproductively on the same topic.
   const signalForLastDay = lastQuestion && lastQuestion.day !== null ? session.competencySignals.get(lastQuestion.day) : null;
   const repeatedStruggle = Boolean(signalForLastDay && signalForLastDay.attempts >= 2 && signalForLastDay.lastShallow);
+
+  // ---------------------------------------------------------------
+  // P6 hook: if the last answer was evaluated by answerEvaluator.js
+  // and carries a recommendedAction, that action drives this turn's
+  // decision directly — taking priority over the score-only heuristic
+  // below. This is the concrete mechanism by which "the evaluation
+  // influences the next question selected by P5." Falls through to the
+  // original heuristic when there's no evaluation yet, the action is
+  // missing/invalid, or the mapped action isn't applicable right now
+  // (e.g. COMPLETE requested before minimums are met).
+  // ---------------------------------------------------------------
+  if (lastEvaluation && VALID_RECOMMENDED_ACTIONS.has(lastEvaluation.recommendedAction)) {
+    const mapped = mapRecommendedActionToDecision(session, lastEvaluation.recommendedAction, {
+      lastQuestion,
+      currentDifficulty,
+      repeatedStruggle,
+      meetsMinimums: meetsCompletionCriteria(session),
+    });
+    if (mapped) return mapped;
+  }
 
   const lastAnswerWeak =
     Boolean(lastEvaluation) &&
@@ -379,6 +543,7 @@ module.exports = {
   STRONG_SCORE_THRESHOLD,
   computeCurrentDifficulty,
   pickNextTopic,
+  mapRecommendedActionToDecision,
   decideNextQuestion,
   generateNextQuestion,
   sanitizeQuestionText,
