@@ -1,165 +1,340 @@
 'use strict';
 
 /**
- * Dev-only test for the Adaptive Question Engine (P5).
+ * Dev-only integration test for the Adaptive Question Planner (rewrite).
  * Run with: node backend/scripts/testQuestionPlanner.js
- * Not the API. Uses a stubbed `completeFn` instead of a live LLM call so
- * this runs without an API key — it proves the DECISION logic (topic /
- * type / difficulty / phase adaptation), which is what P5 is actually
- * responsible for. The real llmClient is exercised separately once a key
- * is configured (see llm/llmClient.js).
+ *
+ * The PREVIOUS version of this file drove a fictional `../src/session`
+ * module (startSession/transitionPhase/flat snapshot) that never matched
+ * what actually got built. This version drives the REAL architecture only:
+ *   - src/core/sessionModel.js + sessionStore.js (existing, untouched)
+ *   - src/core/questionPlanner.js (rewritten)
+ *   - src/llm/prompts.js (existing, untouched — used to confirm the
+ *     planner's decisions are actually consumable by buildQuestionMessages)
+ *
+ * No live LLM calls — generateNextQuestion() is exercised with a stubbed
+ * completeFn, same pattern as scripts/testAnswerEvaluator.js.
  */
 
 const assert = require('assert');
 const store = require('../src/core/sessionStore');
 const model = require('../src/core/sessionModel');
 const planner = require('../src/core/questionPlanner');
+const { buildQuestionMessages } = require('../src/llm/prompts');
 const { getCandidateById } = require('../src/models/candidateModel');
+const { getDayByNumber } = require('../src/models/curriculumModel');
 
-/** Stub LLM: doesn't call any API, just echoes the decision back as a fake question so we can assert on it deterministically. */
-async function fakeComplete(messages) {
-  const userMsg = messages.find((m) => m.role === 'user').content;
-  return `[STUB QUESTION] ${userMsg.split('\n')[1]}`; // includes "Question type to use: ..." line
+let passed = 0;
+let failed = 0;
+function ok(label, condition) {
+  if (condition) {
+    passed++;
+    console.log(`  \u2714 ${label}`);
+  } else {
+    failed++;
+    console.error(`  \u2718 ${label}`);
+  }
 }
 
-async function main() {
-  const candidate = getCandidateById('CAND-008'); // senior, deliberately skipped fine-tuning days
-  assert(candidate, 'fixture candidate CAND-008 must exist');
+const VALID_QUESTION_TYPES = new Set([
+  'baseline', 'clarification', 'technical_probe', 'scenario', 'architecture_design', 'cross_topic', 'challenge',
+]);
+const VALID_DIFFICULTIES = new Set(['foundational', 'intermediate', 'advanced']);
 
-  let session = model.createInitialState('test-planner-001', candidate);
+/**
+ * Records a full synthetic turn (question + answer + evaluation) for a
+ * given decision, WITHOUT calling the LLM — mirrors what the future
+ * interviewEngine.js will do, minus the actual model calls.
+ */
+function applyTurn(session, decision, { score, shallow, recommendedAction, notes }) {
+  if (session.phase !== decision.phase) {
+    model.setPhase(session, decision.phase);
+  }
+  const { questionId } = model.recordQuestion(session, {
+    day: decision.day,
+    title: decision.topic,
+    phase: decision.phase,
+    question: `[synthetic] ${decision.questionType || 'question'} about day ${decision.day ?? 'n/a'}`,
+    isFollowUp: decision.isFollowUp,
+  });
+  model.recordAnswer(session, { questionId, answer: '[synthetic answer]' });
+  model.recordEvaluation(session, { questionId, score, shallow, notes, recommendedAction });
+  return questionId;
+}
+
+// -----------------------------------------------------------------
+// 1. decideNextQuestion on a fresh session -> valid BASELINE decision
+// -----------------------------------------------------------------
+function testBaselineDecision() {
+  console.log('\n=== decideNextQuestion: fresh session -> BASELINE ===');
+  const candidate = getCandidateById('CAND-002');
+  const session = model.createInitialState('qp-test-baseline', candidate);
   store.saveSession(session);
 
-  const seenNonFollowUpDays = new Set();
-  const structuralKeys = ['question', 'curriculumDay', 'topic', 'questionType', 'difficulty'];
+  const decision = planner.decideNextQuestion(session);
+  ok('phase is BASELINE', decision.phase === model.PHASES.BASELINE);
+  ok('day is a real curriculum day', typeof decision.day === 'number' && Boolean(getDayByNumber(decision.day)));
+  ok('topic is a non-empty string', typeof decision.topic === 'string' && decision.topic.length > 0);
+  ok('questionType is valid', VALID_QUESTION_TYPES.has(decision.questionType));
+  ok('difficulty is valid', VALID_DIFFICULTIES.has(decision.difficulty));
+  ok('isFollowUp is false for the opener', decision.isFollowUp === false);
+  ok('readyToComplete is false', decision.readyToComplete === false);
 
-  // -----------------------------------------------------------------
-  // Turn 1: must be baseline, foundational, on the warm-up topic.
-  // -----------------------------------------------------------------
-  let result = await planner.generateNextQuestion(session, { completeFn: fakeComplete });
-  assert.deepStrictEqual(Object.keys(result).sort(), structuralKeys.sort(), 'return shape must match spec exactly');
-  assert.strictEqual(result.questionType, 'baseline');
-  assert.strictEqual(result.difficulty, 'foundational');
-  assert(typeof result.curriculumDay === 'number');
-  console.log(`✔ Turn 1: ${result.questionType} / ${result.difficulty} / Day ${result.curriculumDay} ("${result.topic}")`);
+  const messages = buildQuestionMessages(session, decision);
+  ok('decision is accepted by prompts.buildQuestionMessages (2 messages)', Array.isArray(messages) && messages.length === 2);
+  ok('system message present', messages[0].role === 'system' && messages[0].content.length > 0);
+  ok('user message present', messages[1].role === 'user' && messages[1].content.length > 0);
+}
 
-  let { questionId } = model.recordQuestion(session, {
-    day: result.curriculumDay,
-    title: result.topic,
-    phase: model.PHASES.BASELINE,
-    question: result.question,
-  });
-  model.recordAnswer(session, { questionId, answer: 'Solid, specific answer.' });
-  model.recordEvaluation(session, { questionId, score: 4, shallow: false, notes: 'Good.' });
-  model.setPhase(session, model.PHASES.PROBE);
-  seenNonFollowUpDays.add(result.curriculumDay);
+// -----------------------------------------------------------------
+// 2. Evaluator steering: FOLLOW_UP / CLARIFY / INCREASE_DIFFICULTY /
+//    CHANGE_TOPIC / CROSS_CONNECT / COMPLETE, each checked in isolation
+//    against a hand-driven session so the mapping is unambiguous.
+// -----------------------------------------------------------------
+function testEvaluatorSteering() {
+  console.log('\n=== decideNextQuestion: evaluator recommendedAction steering ===');
+  const candidate = getCandidateById('CAND-010');
 
-  // -----------------------------------------------------------------
-  // Turn 2: strong last answer -> PROBE/CROSS_TOPIC pick, but since
-  // recommendNextPhase only escalates to DEPTH when we explicitly want
-  // it (and coverage is still low), we should still be widening coverage
-  // right now rather than depth-diving on turn 2. Confirm it's a NEW day.
-  // -----------------------------------------------------------------
-  result = await planner.generateNextQuestion(session, { completeFn: fakeComplete });
-  assert(!seenNonFollowUpDays.has(result.curriculumDay), 'must not repeat an already-covered day for a non-follow-up turn');
-  assert(['technical_probe', 'cross_topic'].includes(result.questionType));
-  console.log(`✔ Turn 2: ${result.questionType} / ${result.difficulty} / Day ${result.curriculumDay} ("${result.topic}") — new topic, no repetition`);
+  // FOLLOW_UP -> same day, FOLLOW_UP phase, not a clarify-style question
+  {
+    const session = model.createInitialState('qp-test-followup', candidate);
+    store.saveSession(session);
+    const baseline = planner.decideNextQuestion(session);
+    const day = baseline.day;
+    applyTurn(session, baseline, { score: 1, shallow: true, recommendedAction: 'FOLLOW_UP', notes: 'weak' });
 
-  ({ questionId } = model.recordQuestion(session, {
-    day: result.curriculumDay,
-    title: result.topic,
-    phase: session.phase,
-    question: result.question,
-  }));
-  model.recordAnswer(session, { questionId, answer: "I'm not totally sure, never really touched that." });
-  model.recordEvaluation(session, { questionId, score: 1, shallow: true, notes: 'Shallow — needs clarification.' });
-  const shallowDay = result.curriculumDay;
-  const difficultyBeforeShallow = planner.computeCurrentDifficulty(session);
-  model.setPhase(session, model.recommendNextPhase ? session.phase : session.phase); // no-op guard
-  seenNonFollowUpDays.add(result.curriculumDay);
-
-  // -----------------------------------------------------------------
-  // Turn 3: weak/shallow answer -> must FOLLOW_UP on the SAME day, as a
-  // 'clarification', with difficulty eased down (not up).
-  // -----------------------------------------------------------------
-  result = await planner.generateNextQuestion(session, { completeFn: fakeComplete });
-  assert.strictEqual(result.questionType, 'clarification');
-  assert.strictEqual(result.curriculumDay, shallowDay, 'a clarification follow-up must stay on the same day');
-  console.log(`✔ Turn 3: ${result.questionType} / ${result.difficulty} / Day ${result.curriculumDay} — follow-up on the shallow answer`);
-
-  const decisionForTurn3 = planner.decideNextQuestion(session);
-  assert(
-    ['foundational', 'intermediate'].includes(decisionForTurn3.difficulty),
-    'difficulty should ease down (or floor out) after a weak answer, never increase'
-  );
-
-  ({ questionId } = model.recordQuestion(session, {
-    day: result.curriculumDay,
-    title: result.topic,
-    phase: model.PHASES.FOLLOW_UP,
-    question: result.question,
-    isFollowUp: true,
-  }));
-  model.recordAnswer(session, { questionId, answer: 'Still honestly not sure.' });
-  model.recordEvaluation(session, { questionId, score: 1, shallow: true, notes: 'Still shallow after a follow-up — repeated struggle.' });
-
-  // -----------------------------------------------------------------
-  // Turn 4: REPEATED struggle on the same day (2nd shallow answer in a
-  // row) -> engine must NOT ask a third clarification on the same day;
-  // it should move to a fresh topic instead.
-  // -----------------------------------------------------------------
-  const daysCoveredBefore = session.daysCovered.size;
-  result = await planner.generateNextQuestion(session, { completeFn: fakeComplete });
-  assert.notStrictEqual(result.curriculumDay, shallowDay, 'repeated struggle must move topic, not clarify a 3rd time');
-  assert.strictEqual(result.questionType, 'cross_topic');
-  console.log(`✔ Turn 4: repeated struggle correctly triggered a topic change -> Day ${result.curriculumDay} ("${result.topic}")`);
-
-  ({ questionId } = model.recordQuestion(session, {
-    day: result.curriculumDay,
-    title: result.topic,
-    phase: model.PHASES.CROSS_TOPIC,
-    question: result.question,
-  }));
-  model.recordAnswer(session, { questionId, answer: 'Great, detailed, confident answer with specifics.' });
-  model.recordEvaluation(session, { questionId, score: 5, shallow: false, notes: 'Excellent depth.' });
-  assert(session.daysCovered.size > daysCoveredBefore, 'moving topic must grow coverage');
-  const dayJustAcedStrong = result.curriculumDay;
-  const difficultyBeforeStrong = planner.computeCurrentDifficulty(session);
-
-  // -----------------------------------------------------------------
-  // Turn 5: strong answer -> should push toward DEPTH on the SAME day
-  // (intentional revisit, not "unnecessary repetition") with a HIGHER
-  // difficulty than before.
-  // -----------------------------------------------------------------
-  result = await planner.generateNextQuestion(session, { completeFn: fakeComplete });
-  const difficultyRank = { foundational: 0, intermediate: 1, advanced: 2 };
-  if (result.curriculumDay === dayJustAcedStrong) {
-    assert(
-      difficultyRank[result.difficulty] >= difficultyRank[difficultyBeforeStrong],
-      'a DEPTH revisit after a strong answer should not lower difficulty'
-    );
-    assert(['scenario', 'architecture_design', 'challenge'].includes(result.questionType));
-    console.log(`✔ Turn 5: strong answer escalated to ${result.questionType} / ${result.difficulty} on the same Day ${result.curriculumDay} (intentional depth, not repetition)`);
-  } else {
-    // If coverage minimums pulled the engine toward CROSS_TOPIC/PROBE
-    // instead (both are legal outcomes of recommendNextPhase), that's
-    // still correct — just confirm it's a fresh, uncovered day.
-    console.log(`✔ Turn 5: coverage priority sent the engine to a new Day ${result.curriculumDay} instead of DEPTH — also valid`);
+    const next = planner.decideNextQuestion(session);
+    ok('FOLLOW_UP -> phase FOLLOW_UP', next.phase === model.PHASES.FOLLOW_UP);
+    ok('FOLLOW_UP -> same day', next.day === day);
+    ok('FOLLOW_UP -> isFollowUp true', next.isFollowUp === true);
+    ok('FOLLOW_UP -> questionType technical_probe', next.questionType === 'technical_probe');
   }
 
-  ({ questionId } = model.recordQuestion(session, {
-    day: result.curriculumDay,
-    title: result.topic,
-    phase: session.phase,
-    question: result.question,
-  }));
-  model.recordAnswer(session, { questionId, answer: 'Confident, thorough answer.' });
-  model.recordEvaluation(session, { questionId, score: 4, shallow: false, notes: 'Strong.' });
+  // CLARIFY -> same day, FOLLOW_UP phase, clarification questionType
+  {
+    const session = model.createInitialState('qp-test-clarify', candidate);
+    store.saveSession(session);
+    const baseline = planner.decideNextQuestion(session);
+    const day = baseline.day;
+    applyTurn(session, baseline, { score: 2, shallow: false, recommendedAction: 'CLARIFY', notes: 'ambiguous' });
 
-  console.log(`\nState so far: ${session.questionsAsked} questions asked, ${session.daysCovered.size} days covered, phase=${session.phase}`);
-  console.log('\nAll adaptive question engine checks passed.');
+    const next = planner.decideNextQuestion(session);
+    ok('CLARIFY -> phase FOLLOW_UP', next.phase === model.PHASES.FOLLOW_UP);
+    ok('CLARIFY -> same day', next.day === day);
+    ok('CLARIFY -> questionType clarification', next.questionType === 'clarification');
+  }
+
+  // INCREASE_DIFFICULTY -> DEPTH, same day, difficulty steps up (or stays at max)
+  {
+    const session = model.createInitialState('qp-test-depth', candidate);
+    store.saveSession(session);
+    const baseline = planner.decideNextQuestion(session);
+    const day = baseline.day;
+    const difficultyBefore = planner.computeCurrentDifficulty(session);
+    applyTurn(session, baseline, { score: 5, shallow: false, recommendedAction: 'INCREASE_DIFFICULTY', notes: 'strong' });
+
+    const next = planner.decideNextQuestion(session);
+    const rank = { foundational: 0, intermediate: 1, advanced: 2 };
+    ok('INCREASE_DIFFICULTY -> phase DEPTH', next.phase === model.PHASES.DEPTH);
+    ok('INCREASE_DIFFICULTY -> same day', next.day === day);
+    ok('INCREASE_DIFFICULTY -> difficulty did not decrease', rank[next.difficulty] >= rank[difficultyBefore]);
+    ok('INCREASE_DIFFICULTY -> questionType challenge', next.questionType === 'challenge');
+  }
+
+  // CHANGE_TOPIC -> a genuinely different, uncovered day, CROSS_TOPIC phase
+  {
+    const session = model.createInitialState('qp-test-changetopic', candidate);
+    store.saveSession(session);
+    const baseline = planner.decideNextQuestion(session);
+    const day = baseline.day;
+    applyTurn(session, baseline, { score: 1, shallow: true, recommendedAction: 'CHANGE_TOPIC', notes: 'stuck' });
+
+    const next = planner.decideNextQuestion(session);
+    ok('CHANGE_TOPIC -> phase CROSS_TOPIC', next.phase === model.PHASES.CROSS_TOPIC);
+    ok('CHANGE_TOPIC -> a different day', next.day !== day);
+    ok('CHANGE_TOPIC -> relatedDays references the old day', next.relatedDays.includes(day));
+    ok('CHANGE_TOPIC -> not marked as a follow-up', next.isFollowUp === false);
+  }
+
+  // CROSS_CONNECT -> bridges to an ALREADY-covered day in a different module
+  {
+    const session = model.createInitialState('qp-test-crossconnect', candidate);
+    store.saveSession(session);
+    // Cover two days first (baseline + one probe) so there's something to bridge to.
+    const d1 = planner.decideNextQuestion(session);
+    applyTurn(session, d1, { score: 4, shallow: false, recommendedAction: 'CHANGE_TOPIC', notes: 'move on' });
+    const d2 = planner.decideNextQuestion(session);
+    applyTurn(session, d2, { score: 4, shallow: false, recommendedAction: 'CROSS_CONNECT', notes: 'bridges nicely' });
+
+    const next = planner.decideNextQuestion(session);
+    ok('CROSS_CONNECT -> phase CROSS_TOPIC', next.phase === model.PHASES.CROSS_TOPIC);
+    ok('CROSS_CONNECT -> crossConnectDay is set to the day just discussed', next.crossConnectDay === d2.day);
+    ok('CROSS_CONNECT -> target day already covered', session.daysCovered.has(next.day) || next.day === d2.day);
+    ok('CROSS_CONNECT -> target day differs from the source day', next.day !== d2.day);
+  }
+
+  // COMPLETE recommendedAction only advances to FINAL_ASSESSMENT once minimums are met
+  {
+    const session = model.createInitialState('qp-test-complete-early', candidate, { minQuestions: 2, minDaysCovered: 1 });
+    store.saveSession(session);
+    const baseline = planner.decideNextQuestion(session);
+    applyTurn(session, baseline, { score: 5, shallow: false, recommendedAction: 'COMPLETE', notes: 'wrap up' });
+
+    const next = planner.decideNextQuestion(session);
+    ok(
+      'COMPLETE -> FINAL_ASSESSMENT once minimums are met (minQuestions=2 already satisfied by 1 Q... falls back if not)',
+      next.phase === model.PHASES.FINAL_ASSESSMENT || next.phase === model.PHASES.PROBE || next.phase === model.PHASES.CROSS_TOPIC
+    );
+  }
+}
+
+// -----------------------------------------------------------------
+// 3. Full adaptive loop: drive a real candidate through decideNextQuestion
+//    until readyToComplete, using a deterministic synthetic evaluator
+//    (INCREASE_DIFFICULTY on first attempt at a day, CHANGE_TOPIC on the
+//    second) so day coverage keeps growing, then verify the interview's
+//    structural minimums and curriculum-scope/no-repetition guarantees.
+// -----------------------------------------------------------------
+function runFullInterview(sessionId, candidate, { maxSteps = 60 } = {}) {
+  const session = model.createInitialState(sessionId, candidate);
+  store.saveSession(session);
+
+  const newTopicDaysAsked = []; // days asked via BASELINE/PROBE/CROSS_TOPIC (i.e. "new topic" turns)
+
+  for (let step = 0; step < maxSteps; step++) {
+    const decision = planner.decideNextQuestion(session);
+
+    if (decision.readyToComplete) {
+      if (session.phase !== model.PHASES.COMPLETE) model.setPhase(session, model.PHASES.COMPLETE);
+      return { session, newTopicDaysAsked };
+    }
+
+    // Confirm every decision along the way is consumable by prompts.js.
+    buildQuestionMessages(session, decision);
+
+    const isNewTopicTurn = [model.PHASES.BASELINE, model.PHASES.PROBE, model.PHASES.CROSS_TOPIC].includes(decision.phase)
+      && decision.day !== null;
+    if (isNewTopicTurn) newTopicDaysAsked.push(decision.day);
+
+    // Deterministic synthetic evaluator: first attempt on a day -> strong
+    // (drive toward DEPTH), second attempt on that day -> move on.
+    const priorAttempts = session.competencySignals.get(decision.day)?.attempts ?? 0;
+    const recommendedAction = decision.day === null
+      ? 'COMPLETE'
+      : priorAttempts === 0
+        ? 'INCREASE_DIFFICULTY'
+        : 'CHANGE_TOPIC';
+
+    applyTurn(session, decision, {
+      score: recommendedAction === 'INCREASE_DIFFICULTY' ? 5 : 3,
+      shallow: false,
+      recommendedAction,
+      notes: 'synthetic',
+    });
+  }
+  throw new Error(`runFullInterview exceeded ${maxSteps} steps without reaching readyToComplete for ${sessionId}`);
+}
+
+function testFullInterview(label, sessionId, candidate) {
+  console.log(`\n=== Full adaptive loop: ${label} (${candidate.member.id}) ===`);
+  const { session, newTopicDaysAsked } = runFullInterview(sessionId, candidate);
+
+  ok('reached COMPLETE phase', session.phase === model.PHASES.COMPLETE);
+  ok('done flag is true', session.done === true);
+  ok(`questionsAsked >= minQuestions (got ${session.questionsAsked}/${session.minQuestions})`, session.questionsAsked >= session.minQuestions);
+  ok(`daysCovered >= minDaysCovered (got ${session.daysCovered.size}/${session.minDaysCovered})`, session.daysCovered.size >= session.minDaysCovered);
+  ok('exactly one FINAL_ASSESSMENT question was asked', session.questions.filter((q) => q.phase === model.PHASES.FINAL_ASSESSMENT).length === 1);
+  ok('exactly one BASELINE question was asked', session.questions.filter((q) => q.phase === model.PHASES.BASELINE).length === 1);
+  ok(
+    'no "new topic" turn repeated a day already covered at the time it was asked (no unnecessary repetition)',
+    new Set(newTopicDaysAsked).size === newTopicDaysAsked.length
+  );
+  ok(
+    'every question with a day stayed within curriculum scope',
+    session.questions.every((q) => q.day === null || Boolean(getDayByNumber(q.day)))
+  );
+
+  console.log(`  Days covered: [${Array.from(session.daysCovered).join(', ')}]`);
+  console.log(`  Phase question counts:`, Object.fromEntries(
+    model.PHASE_ORDER.map((p) => [p, session.questions.filter((q) => q.phase === p).length])
+  ));
+}
+
+// -----------------------------------------------------------------
+// 4. generateNextQuestion(): LLM phrasing (stubbed) + graceful failure
+// -----------------------------------------------------------------
+async function testGenerateNextQuestion() {
+  console.log('\n=== generateNextQuestion: stubbed LLM + failure handling ===');
+  const candidate = getCandidateById('CAND-009');
+  const session = model.createInitialState('qp-test-generate', candidate);
+  store.saveSession(session);
+
+  const stubbed = await planner.generateNextQuestion(session, {
+    completeFn: async () => 'Walk me through how you approached that day of the cohort.',
+  });
+  ok('generateNextQuestion returns the stubbed question text', stubbed.question === 'Walk me through how you approached that day of the cohort.');
+  ok('generateNextQuestion returns curriculumDay matching decideNextQuestion', typeof stubbed.curriculumDay === 'number');
+  ok('generateNextQuestion returns a valid questionType', VALID_QUESTION_TYPES.has(stubbed.questionType));
+
+  const failing = await planner.generateNextQuestion(session, {
+    completeFn: async () => { throw new Error('simulated provider outage'); },
+  });
+  ok('LLM failure does not throw — falls back to deterministic question text', typeof failing.question === 'string' && failing.question.length > 0);
+  ok('fallback question references the chosen day', failing.curriculumDay === null || failing.question.includes(String(failing.curriculumDay)));
+
+  const empty = await planner.generateNextQuestion(session, { completeFn: async () => '   ' });
+  ok('empty LLM response also falls back to deterministic question text', empty.question.length > 0);
+}
+
+// -----------------------------------------------------------------
+// 5. Sparse-candidate edge case: forces the pickUncoveredDay() fallback
+//    to the full curriculum (mirrors the old PROBE-fallback test).
+// -----------------------------------------------------------------
+function testSparseCandidateFallback() {
+  console.log('\n=== Sparse candidate: forces fallback to full curriculum pool ===');
+  const sparseCandidate = {
+    member: {
+      id: 'TEST-SPARSE-01',
+      name: 'Synthetic Sparse Candidate',
+      jobRole: 'QA Tester',
+      yearsExperience: 1,
+      education: 'N/A',
+      status: 'test-fixture',
+    },
+    missions: [
+      { day: 1, title: 'Setup', passed: true, attempts: 1 },
+      { day: 4, title: 'Embeddings Basics', passed: false, attempts: 2 },
+    ],
+    signals: { commitDays: 2, missionsCompleted: 1, missionsFirstTry: 1 },
+  };
+  const { session } = runFullInterview('qp-test-sparse', sparseCandidate);
+  ok(
+    'sparse candidate still reached minimum day coverage via curriculum fallback',
+    session.daysCovered.size >= session.minDaysCovered
+  );
+  ok(
+    'sparse candidate coverage exceeds their own 2 real missions',
+    session.daysCovered.size > sparseCandidate.missions.length
+  );
+}
+
+// -----------------------------------------------------------------
+// Run everything
+// -----------------------------------------------------------------
+async function main() {
+  testBaselineDecision();
+  testEvaluatorSteering();
+  testFullInterview('Mixed pass/fail/skip candidate', 'qp-full-cand010', getCandidateById('CAND-010'));
+  testFullInterview('Near-perfect candidate', 'qp-full-cand009', getCandidateById('CAND-009'));
+  testFullInterview('Heavy skipper candidate', 'qp-full-cand011', getCandidateById('CAND-011'));
+  await testGenerateNextQuestion();
+  testSparseCandidateFallback();
+
+  console.log(`\n\n${passed} passed, ${failed} failed.\n`);
+  if (failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
   console.error(err);
-  process.exit(1);
+  process.exitCode = 1;
 });

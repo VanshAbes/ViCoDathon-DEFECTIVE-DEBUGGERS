@@ -1,550 +1,538 @@
 'use strict';
 
 /**
- * Adaptive Question Engine (P5)
- * ==============================
- * Decides what to ask next. Built entirely on top of the layers already
- * in place — it does not re-derive anything the earlier layers already
- * computed:
+ * Adaptive Question Planner (P5) — rewritten to target the REAL session
+ * architecture (src/core/sessionModel.js + sessionStore.js), the REAL
+ * answer evaluator (src/core/answerEvaluator.js), and the REAL prompt
+ * builder (src/llm/prompts.js).
  *
- *   - intelligence/probingEngine        (P2) — ranks candidate topics by
- *     how much interview signal they carry (skipped/failed first, etc).
- *   - intelligence/candidateProfileEngine (P3) — recommendedDifficulty,
- *     recommendedStartingTopics.
- *   - core/sessionModel                 (P4) — phase state machine,
- *     coverage tracking, evaluation history.
+ * The previous version of this file was built against a `../session`
+ * module and a `../intelligence` (mis-spelled path) that never matched
+ * what actually got built. It has been replaced outright rather than
+ * patched — see the integration audit for details.
  *
- * This module adds exactly one new thing: the WHICH-TOPIC / WHAT-TYPE /
- * WHAT-DIFFICULTY decision for the *next* turn, adapting to the running
- * evaluation history instead of following a fixed script.
+ * Two responsibilities only:
  *
- * Two layers, deliberately separated:
- *   - decideNextQuestion(session)   — pure, synchronous, deterministic.
- *     No LLM call. Given the same session state it always returns the
- *     same decision. This is what makes the engine testable and
- *     debuggable without needing an API key.
- *   - generateNextQuestion(session) — async. Takes that decision, builds
- *     a grounded prompt (llm/prompts.js), and asks the LLM (llm/llmClient.js)
- *     to phrase it as one natural question. Returns the structured shape
- *     the interview engine/API will hand back to the frontend.
+ *   1. decideNextQuestion(session)   — PURE, READ-ONLY. Given a session's
+ *      current state, decides what the next question should be about:
+ *      phase, curriculum day, topic, question type, difficulty, and
+ *      whether it's a follow-up. Never mutates session state and never
+ *      calls setPhase/recordQuestion itself — the orchestrator (the
+ *      future interviewEngine.js) is responsible for actually applying
+ *      the transition and recording the question, exactly like the
+ *      original design's philosophy.
  *
- * Chain-of-thought is never exposed: decideNextQuestion's output is
- * server-side routing metadata (day/type/difficulty), not reasoning text,
- * and the system prompt explicitly forbids the LLM from explaining itself
- * (see llm/prompts.js). The public return shape is exactly:
- *   { question, curriculumDay, topic, questionType, difficulty }
+ *   2. generateNextQuestion(session, options) — calls decideNextQuestion(),
+ *      builds the LLM messages via prompts.buildQuestionMessages(), and
+ *      calls llmClient.complete() (or an injectable options.completeFn,
+ *      matching the pattern answerEvaluator.js already uses) to actually
+ *      phrase the question. Falls back to a deterministic, content-
+ *      agnostic question if the LLM call fails or returns nothing.
+ *
+ * Also exports computeCurrentDifficulty(session) since it's useful on
+ * its own (tests / future callers) and generateNextQuestion relies on it.
+ *
+ * P6 -> P5 wiring: answerEvaluator.js's evaluations are read here via
+ * session.evaluations (the last recorded evaluation's `recommendedAction`)
+ * and used to steer the next decision — this takes priority over the
+ * plain coverage/phase heuristics, mirroring the intent already
+ * documented in sessionModel.js's recordEvaluation() JSDoc.
  */
 
-const {
-  PHASES,
-  isDayCovered,
-  getUncoveredTopics,
-  recommendNextPhase,
-  meetsCompletionCriteria,
-} = require('./sessionModel');
-const { getTopicsForDeeperProbing } = require('../intelligence/probingEngine');
-const { DIFFICULTY_LEVELS } = require('../intelligence/candidateProfileEngine');
-const { getModuleForDay } = require('../models/curriculumModel');
-const llmClient = require('../llm/llmClient');
+const sessionModel = require('./sessionModel');
+const { getAllDays, getDayByNumber, getModuleForDay } = require('../models/curriculumModel');
+const { DIFFICULTY_LEVELS } = require('../intellegence/candidateProfileEngine');
 const { buildQuestionMessages } = require('../llm/prompts');
-const { RECOMMENDED_ACTIONS } = require('./answerEvaluator');
+const llmClient = require('../llm/llmClient');
 
-/** Set of valid P6 recommendedAction values, for cheap membership checks below. */
-const VALID_RECOMMENDED_ACTIONS = new Set(Object.values(RECOMMENDED_ACTIONS));
+const { PHASES } = sessionModel;
 
-/** Supported question types (spec). */
-const QUESTION_TYPES = Object.freeze({
+/**
+ * Maps a phase (or evaluator-driven intent) to the questionType key that
+ * prompts.js's QUESTION_TYPE_GUIDANCE understands. Kept as plain data so
+ * it's obvious at a glance and doesn't duplicate any prompt-building logic.
+ */
+const QUESTION_TYPE_BY_INTENT = {
   BASELINE: 'baseline',
-  CLARIFICATION: 'clarification',
-  TECHNICAL_PROBE: 'technical_probe',
-  SCENARIO: 'scenario',
-  ARCHITECTURE_DESIGN: 'architecture_design',
+  PROBE: 'technical_probe',
+  FOLLOW_UP: 'technical_probe',
+  CLARIFY: 'clarification',
+  DEPTH: 'challenge',
   CROSS_TOPIC: 'cross_topic',
-  CHALLENGE: 'challenge',
-});
-
-/** A shallow-answer score at or below this is treated as "weak," regardless of the `shallow` flag. */
-const WEAK_SCORE_THRESHOLD = 2;
-/** A strong-answer score at or above this can trigger a difficulty increase / DEPTH phase. */
-const STRONG_SCORE_THRESHOLD = 4;
+  CROSS_CONNECT: 'cross_topic',
+  FINAL_ASSESSMENT: 'baseline',
+};
 
 // ---------------------------------------------------------------------
-// Difficulty ladder helpers
+// Difficulty helpers
 // ---------------------------------------------------------------------
 
-function stepUp(difficulty) {
-  const idx = DIFFICULTY_LEVELS.indexOf(difficulty);
-  return DIFFICULTY_LEVELS[Math.min(DIFFICULTY_LEVELS.length - 1, idx + 1)];
+function difficultyIndex(level) {
+  const idx = DIFFICULTY_LEVELS.indexOf(level);
+  return idx === -1 ? 0 : idx;
 }
 
-function stepDown(difficulty) {
-  const idx = DIFFICULTY_LEVELS.indexOf(difficulty);
-  return DIFFICULTY_LEVELS[Math.max(0, idx - 1)];
+function stepDifficulty(level, delta) {
+  const idx = Math.max(0, Math.min(DIFFICULTY_LEVELS.length - 1, difficultyIndex(level) + delta));
+  return DIFFICULTY_LEVELS[idx];
 }
 
 /**
- * Walks the session's evaluation history in order, starting from the
- * candidate's P3-recommended difficulty, nudging up on strong answers and
- * down on weak/shallow ones. Deterministic and stateless (no extra field
- * needed on the session) — recomputed each turn from `session.evaluations`.
+ * Current difficulty = the candidate's deterministic P3 baseline
+ * (session.profile.recommendedDifficulty.level), nudged by the single
+ * most recent evaluation's recommendedAction:
+ *   - INCREASE_DIFFICULTY steps up one level (capped at 'advanced')
+ *   - a CHANGE_TOPIC triggered by a genuinely weak answer (score <= 1)
+ *     steps down one level (capped at 'foundational')
+ *   - anything else keeps the baseline level
+ * Deliberately simple (one-step, not cumulative across the whole
+ * transcript) — a content-agnostic, explainable rule, matching the same
+ * "no opaque weighted score" philosophy candidateProfileEngine.js uses.
  *
  * @param {import('./sessionModel').SessionState} session
  * @returns {'foundational'|'intermediate'|'advanced'}
  */
 function computeCurrentDifficulty(session) {
-  let idx = DIFFICULTY_LEVELS.indexOf(session.profile.recommendedDifficulty.level);
-  if (idx < 0) idx = 0;
-
-  for (const evaluation of session.evaluations) {
-    const weak = evaluation.shallow || (typeof evaluation.score === 'number' && evaluation.score <= WEAK_SCORE_THRESHOLD);
-    const strong = !evaluation.shallow && typeof evaluation.score === 'number' && evaluation.score >= STRONG_SCORE_THRESHOLD;
-    if (weak) idx = Math.max(0, idx - 1);
-    else if (strong) idx = Math.min(DIFFICULTY_LEVELS.length - 1, idx + 1);
+  const base = session.profile.recommendedDifficulty.level;
+  const lastEval = session.evaluations[session.evaluations.length - 1];
+  if (!lastEval) return base;
+  if (lastEval.recommendedAction === 'INCREASE_DIFFICULTY') return stepDifficulty(base, 1);
+  if (lastEval.recommendedAction === 'CHANGE_TOPIC' && typeof lastEval.score === 'number' && lastEval.score <= 1) {
+    return stepDifficulty(base, -1);
   }
-  return DIFFICULTY_LEVELS[idx];
+  return base;
 }
 
 // ---------------------------------------------------------------------
-// Topic selection helpers
+// Small read-only helpers over the REAL SessionState
 // ---------------------------------------------------------------------
 
-/**
- * Picks the highest-signal curriculum day this candidate hasn't been
- * asked about yet, using the existing probing ranking (P2) so
- * skipped/failed topics are prioritized over clean first-try passes —
- * then falls back to the session's own topic pool if the ranking is
- * somehow exhausted first.
- * @param {import('./sessionModel').SessionState} session
- * @returns {{ day:number, title:string, module:string|null, candidateStatus:string, attempts:number|null }|null}
- */
-function pickNextTopic(session) {
-  const ranked = getTopicsForDeeperProbing(session.candidate);
-  for (const p of ranked) {
-    if (!isDayCovered(session, p.day.day)) {
-      return {
-        day: p.day.day,
-        title: p.day.title,
-        module: p.day.module ? p.day.module.title : null,
-        candidateStatus: p.day.candidateStatus,
-        attempts: p.day.attempts,
-      };
-    }
-  }
-  const fallback = getUncoveredTopics(session)[0];
-  return fallback
-    ? {
-        day: fallback.day,
-        title: fallback.title,
-        module: fallback.module,
-        candidateStatus: fallback.candidateStatus ?? null,
-        attempts: fallback.attempts ?? null,
-      }
-    : null;
+function countQuestionsInPhase(session, phase) {
+  return session.questions.filter((q) => q.phase === phase).length;
 }
 
 /**
+ * Looks up display info (title/module/candidateStatus/attempts) for a
+ * curriculum day, preferring the candidate-enriched session.topicPool
+ * (has candidateStatus/attempts) and falling back to raw curriculum data
+ * for days outside the candidate's own mission history (the same
+ * "fallback" concept the original planner had for sparse candidates).
  * @param {import('./sessionModel').SessionState} session
  * @param {number|null} day
- * @returns {{ module:string|null, candidateStatus:string|null, attempts:number|null }}
  */
-function lookupTopicContext(session, day) {
-  if (day === null) return { module: null, candidateStatus: null, attempts: null };
-  const fromPool = session.topicPool.find((t) => t.day === day);
-  if (fromPool) return { module: fromPool.module, candidateStatus: fromPool.candidateStatus, attempts: fromPool.attempts };
-  const mod = getModuleForDay(day);
-  return { module: mod ? mod.title : null, candidateStatus: null, attempts: null };
-}
-
-/**
- * Translates a P6 `recommendedAction` into a concrete question decision.
- * Returns `null` when the action isn't actionable right now (e.g. no
- * prior question to follow up on, or COMPLETE requested before the P4
- * minimums are met) — in that case the caller falls back to the
- * score-based heuristic instead.
- *
- * @param {import('./sessionModel').SessionState} session
- * @param {string} recommendedAction - one of RECOMMENDED_ACTIONS
- * @param {{ lastQuestion: object|null, currentDifficulty: string, repeatedStruggle: boolean, meetsMinimums: boolean }} ctx
- * @returns {QuestionDecision|null}
- */
-function mapRecommendedActionToDecision(session, recommendedAction, ctx) {
-  const { lastQuestion, currentDifficulty, repeatedStruggle, meetsMinimums } = ctx;
-
-  switch (recommendedAction) {
-    case RECOMMENDED_ACTIONS.FOLLOW_UP: {
-      // A repeated struggle means we've already clarified once and it's
-      // still not landing — don't clarify a third time, let the caller's
-      // heuristic (which will route to CROSS_TOPIC) take over instead.
-      if (repeatedStruggle || !lastQuestion) return null;
-      const topicCtx = lookupTopicContext(session, lastQuestion.day);
-      return {
-        phase: PHASES.FOLLOW_UP,
-        day: lastQuestion.day,
-        topic: lastQuestion.title,
-        module: topicCtx.module,
-        candidateStatus: topicCtx.candidateStatus,
-        attempts: topicCtx.attempts,
-        questionType: QUESTION_TYPES.CLARIFICATION,
-        difficulty: stepDown(currentDifficulty),
-        isFollowUp: true,
-      };
-    }
-
-    case RECOMMENDED_ACTIONS.CLARIFY: {
-      if (repeatedStruggle || !lastQuestion) return null;
-      const topicCtx = lookupTopicContext(session, lastQuestion.day);
-      return {
-        phase: PHASES.FOLLOW_UP,
-        day: lastQuestion.day,
-        topic: lastQuestion.title,
-        module: topicCtx.module,
-        candidateStatus: topicCtx.candidateStatus,
-        attempts: topicCtx.attempts,
-        questionType: QUESTION_TYPES.CLARIFICATION,
-        // CLARIFY means "the answer was ambiguous," not "it was wrong" —
-        // keep difficulty steady rather than easing it down like FOLLOW_UP.
-        difficulty: currentDifficulty,
-        isFollowUp: true,
-      };
-    }
-
-    case RECOMMENDED_ACTIONS.INCREASE_DIFFICULTY: {
-      if (!lastQuestion) return null;
-      const harder = stepUp(currentDifficulty);
-      const topicCtx = lookupTopicContext(session, lastQuestion.day);
-      const questionType =
-        harder === 'advanced'
-          ? QUESTION_TYPES.CHALLENGE
-          : harder === 'intermediate'
-            ? QUESTION_TYPES.SCENARIO
-            : QUESTION_TYPES.ARCHITECTURE_DESIGN;
-      return {
-        phase: PHASES.DEPTH,
-        day: lastQuestion.day,
-        topic: lastQuestion.title,
-        module: topicCtx.module,
-        candidateStatus: topicCtx.candidateStatus,
-        attempts: topicCtx.attempts,
-        questionType,
-        difficulty: harder,
-        isFollowUp: false,
-      };
-    }
-
-    case RECOMMENDED_ACTIONS.CHANGE_TOPIC: {
-      const next = pickNextTopic(session);
-      return {
-        phase: PHASES.CROSS_TOPIC,
-        day: next ? next.day : null,
-        topic: next ? next.title : null,
-        module: next ? next.module : null,
-        candidateStatus: next ? next.candidateStatus : null,
-        attempts: next ? next.attempts : null,
-        questionType: QUESTION_TYPES.CROSS_TOPIC,
-        difficulty: repeatedStruggle ? stepDown(currentDifficulty) : currentDifficulty,
-        isFollowUp: false,
-      };
-    }
-
-    case RECOMMENDED_ACTIONS.CROSS_CONNECT: {
-      const next = pickNextTopic(session);
-      // Bridges the new (still-uncovered, so coverage keeps growing) topic
-      // back to the one just discussed — prompts.js uses crossConnectDay/
-      // crossConnectTopic to ask the LLM to connect the two explicitly.
-      return {
-        phase: PHASES.CROSS_TOPIC,
-        day: next ? next.day : null,
-        topic: next ? next.title : null,
-        module: next ? next.module : null,
-        candidateStatus: next ? next.candidateStatus : null,
-        attempts: next ? next.attempts : null,
-        questionType: QUESTION_TYPES.SCENARIO,
-        difficulty: currentDifficulty,
-        isFollowUp: false,
-        crossConnectDay: lastQuestion ? lastQuestion.day : null,
-        crossConnectTopic: lastQuestion ? lastQuestion.title : null,
-      };
-    }
-
-    case RECOMMENDED_ACTIONS.COMPLETE: {
-      // Only honored once the hard P4 minimums are actually met — this
-      // is a hint to wrap up, not an override of "never finish early."
-      if (!meetsMinimums) return null;
-      return {
-        phase: PHASES.FINAL_ASSESSMENT,
-        day: null,
-        topic: 'Overall reflection',
-        module: null,
-        candidateStatus: null,
-        attempts: null,
-        questionType: QUESTION_TYPES.SCENARIO,
-        difficulty: currentDifficulty,
-        isFollowUp: false,
-      };
-    }
-
-    default:
-      return null;
+function getDayInfo(session, day) {
+  if (day === null || day === undefined) {
+    return { title: null, module: null, candidateStatus: null, attempts: null };
   }
+  const fromPool = session.topicPool.find((t) => t.day === day);
+  if (fromPool) {
+    return { title: fromPool.title, module: fromPool.module, candidateStatus: fromPool.candidateStatus, attempts: fromPool.attempts };
+  }
+  const curriculumDay = getDayByNumber(day);
+  const mod = getModuleForDay(day);
+  return {
+    title: curriculumDay ? curriculumDay.title : null,
+    module: mod ? mod.title : null,
+    candidateStatus: null,
+    attempts: null,
+  };
+}
+
+/**
+ * Picks the next best not-yet-covered curriculum day, reusing
+ * sessionModel.getUncoveredTopics() (already prioritized: plannedTopics
+ * first — themselves ranked by P3's weak/failed/skipped-first logic —
+ * then the rest of the candidate-relevant topicPool). Falls back to any
+ * curriculum day at all if the candidate-relevant pool is exhausted, so
+ * the interview can still legally reach the minimum day coverage (same
+ * fallback concept the original planner had for sparse candidates).
+ * @param {import('./sessionModel').SessionState} session
+ * @param {number[]} [excludeDays]
+ */
+function pickUncoveredDay(session, excludeDays = []) {
+  const uncovered = sessionModel.getUncoveredTopics(session).filter((t) => !excludeDays.includes(t.day));
+  if (uncovered.length > 0) return { day: uncovered[0].day, title: uncovered[0].title, module: uncovered[0].module };
+
+  const covered = session.daysCovered;
+  const fallback = getAllDays().find((d) => !covered.has(d.day) && !excludeDays.includes(d.day));
+  if (!fallback) return null; // curriculum genuinely exhausted — edge case
+  const mod = getModuleForDay(fallback.day);
+  return { day: fallback.day, title: fallback.title, module: mod ? mod.title : null };
+}
+
+/**
+ * Picks an already-covered day in a DIFFERENT curriculum module than
+ * `sourceDay`, for a genuine cross-topic connection (CROSS_CONNECT).
+ * Falls back to any other covered day if no module diversity exists yet.
+ * @param {import('./sessionModel').SessionState} session
+ * @param {number} sourceDay
+ * @returns {number|null}
+ */
+function pickCrossConnectPartner(session, sourceDay) {
+  const sourceModule = getModuleForDay(sourceDay);
+  const others = Array.from(session.daysCovered).filter((d) => d !== sourceDay);
+  const diverseModule = others.find((d) => {
+    const mod = getModuleForDay(d);
+    return mod && sourceModule && mod.n !== sourceModule.n;
+  });
+  if (diverseModule !== undefined) return diverseModule;
+  return others.length > 0 ? others[0] : null;
 }
 
 // ---------------------------------------------------------------------
-// Core decision logic
+// Decision builders — each returns a full decision object compatible
+// with prompts.buildQuestionMessages(), or null if it couldn't find a
+// valid day to ask about (caller falls back to coverage-driven logic).
+// ---------------------------------------------------------------------
+
+function baseDecision(session, overrides) {
+  return {
+    phase: null,
+    day: null,
+    topic: null,
+    module: null,
+    candidateStatus: null,
+    attempts: null,
+    relatedDays: [],
+    crossConnectDay: null,
+    crossConnectTopic: null,
+    questionType: null,
+    difficulty: computeCurrentDifficulty(session),
+    isFollowUp: false,
+    rationale: '',
+    readyToComplete: false,
+    ...overrides,
+  };
+}
+
+function buildBaselineDecision(session) {
+  const warmUp = session.plannedTopics.find((t) => t.role === 'warm-up') || session.plannedTopics[0];
+  const topic = warmUp || pickUncoveredDay(session, []);
+  if (!topic) return null;
+  const info = getDayInfo(session, topic.day);
+  return baseDecision(session, {
+    phase: PHASES.BASELINE,
+    day: topic.day,
+    topic: info.title || topic.title,
+    module: info.module || topic.module || null,
+    candidateStatus: info.candidateStatus,
+    attempts: info.attempts,
+    questionType: QUESTION_TYPE_BY_INTENT.BASELINE,
+    isFollowUp: false,
+    rationale: warmUp
+      ? `Opening warm-up on Day ${topic.day} (${warmUp.reason || 'a topic they handled well'}).`
+      : `Opening warm-up on Day ${topic.day} — no clean first-try pass on record, using the next available topic.`,
+  });
+}
+
+function buildProbeDecision(session, excludeDays = []) {
+  const next = pickUncoveredDay(session, excludeDays);
+  if (!next) return null;
+  const info = getDayInfo(session, next.day);
+  return baseDecision(session, {
+    phase: PHASES.PROBE,
+    day: next.day,
+    topic: info.title || next.title,
+    module: info.module || next.module || null,
+    candidateStatus: info.candidateStatus,
+    attempts: info.attempts,
+    questionType: QUESTION_TYPE_BY_INTENT.PROBE,
+    isFollowUp: false,
+    rationale: `Grounding a new question in Day ${next.day} to build curriculum coverage.`,
+  });
+}
+
+function buildFollowUpDecision(session, day, { clarify = false } = {}) {
+  if (day === null || day === undefined) return null;
+  const info = getDayInfo(session, day);
+  return baseDecision(session, {
+    phase: PHASES.FOLLOW_UP,
+    day,
+    topic: info.title,
+    module: info.module,
+    candidateStatus: info.candidateStatus,
+    attempts: info.attempts,
+    questionType: clarify ? QUESTION_TYPE_BY_INTENT.CLARIFY : QUESTION_TYPE_BY_INTENT.FOLLOW_UP,
+    isFollowUp: true,
+    rationale: clarify
+      ? `Last answer on Day ${day} was ambiguous/off-target — asking them to clarify or restate.`
+      : `Last answer on Day ${day} was weak or shallow — digging deeper on the same topic.`,
+  });
+}
+
+function buildDepthDecision(session, day) {
+  if (day === null || day === undefined) return null;
+  const info = getDayInfo(session, day);
+  return baseDecision(session, {
+    phase: PHASES.DEPTH,
+    day,
+    topic: info.title,
+    module: info.module,
+    candidateStatus: info.candidateStatus,
+    attempts: info.attempts,
+    questionType: QUESTION_TYPE_BY_INTENT.DEPTH,
+    isFollowUp: true,
+    rationale: `Strong answer on Day ${day} — increasing difficulty to confirm real depth.`,
+  });
+}
+
+function buildChangeTopicDecision(session, sourceDay) {
+  const next = pickUncoveredDay(session, sourceDay !== null && sourceDay !== undefined ? [sourceDay] : []);
+  if (!next) return null;
+  const info = getDayInfo(session, next.day);
+  return baseDecision(session, {
+    phase: PHASES.CROSS_TOPIC,
+    day: next.day,
+    topic: info.title || next.title,
+    module: info.module || next.module || null,
+    candidateStatus: info.candidateStatus,
+    attempts: info.attempts,
+    relatedDays: sourceDay !== null && sourceDay !== undefined ? [sourceDay] : [],
+    questionType: QUESTION_TYPE_BY_INTENT.CROSS_TOPIC,
+    isFollowUp: false,
+    rationale: sourceDay !== null && sourceDay !== undefined
+      ? `Candidate struggled repeatedly on Day ${sourceDay} — moving on to a new topic (Day ${next.day}).`
+      : `Moving on to a new topic (Day ${next.day}).`,
+  });
+}
+
+function buildCrossConnectDecision(session, sourceDay) {
+  if (sourceDay === null || sourceDay === undefined) return null;
+  const targetDay = pickCrossConnectPartner(session, sourceDay);
+  if (targetDay === null || targetDay === undefined) return null;
+  const sourceInfo = getDayInfo(session, sourceDay);
+  const targetInfo = getDayInfo(session, targetDay);
+  return baseDecision(session, {
+    phase: PHASES.CROSS_TOPIC,
+    day: targetDay,
+    topic: targetInfo.title,
+    module: targetInfo.module,
+    candidateStatus: targetInfo.candidateStatus,
+    attempts: targetInfo.attempts,
+    relatedDays: [sourceDay],
+    crossConnectDay: sourceDay,
+    crossConnectTopic: sourceInfo.title,
+    questionType: QUESTION_TYPE_BY_INTENT.CROSS_CONNECT,
+    isFollowUp: false,
+    rationale: `Candidate's answer on Day ${sourceDay} ("${sourceInfo.title}") opened a natural bridge to Day ${targetDay} ("${targetInfo.title}").`,
+  });
+}
+
+function buildFinalAssessmentDecision(session) {
+  return baseDecision(session, {
+    phase: PHASES.FINAL_ASSESSMENT,
+    day: null,
+    topic: null,
+    module: null,
+    questionType: QUESTION_TYPE_BY_INTENT.FINAL_ASSESSMENT,
+    isFollowUp: false,
+    rationale: 'Closing reflective question to wrap up the interview.',
+  });
+}
+
+function buildReadyToCompleteDecision(session) {
+  return baseDecision(session, {
+    phase: PHASES.COMPLETE,
+    readyToComplete: true,
+    rationale: 'Final assessment question already asked and answered — interview ready to complete.',
+  });
+}
+
+// ---------------------------------------------------------------------
+// Public entry point #1: decideNextQuestion (pure, read-only)
 // ---------------------------------------------------------------------
 
 /**
- * @typedef {Object} QuestionDecision
- * @property {string} phase
- * @property {number|null} day
- * @property {string|null} topic
- * @property {string|null} module
- * @property {string|null} candidateStatus
- * @property {number|null} attempts
- * @property {string} questionType  - one of QUESTION_TYPES
- * @property {string} difficulty    - one of DIFFICULTY_LEVELS
- * @property {boolean} isFollowUp
- */
-
-/**
- * Pure decision function: given the current session state, decides the
- * next question's phase/topic/type/difficulty. No LLM call, no side
- * effects, fully deterministic — same session state in, same decision
- * out, which is what makes this testable without an API key.
+ * Decides what the next interview question should be about, given the
+ * session's CURRENT real state. Never mutates the session. The caller
+ * (eventually interviewEngine.js) is responsible for calling
+ * sessionModel.setPhase()/recordQuestion() to actually apply this.
  *
- * Behavior implemented (per spec):
- *   - weak/shallow answer          -> FOLLOW_UP, questionType 'clarification', difficulty eased down
- *   - repeated struggle (2+ shallow/weak answers on the same day) -> stop
- *     drilling with more clarifications, move to a fresh topic instead
- *   - strong answer                -> DEPTH on the same topic, difficulty stepped up,
- *     type escalates toward 'scenario' / 'architecture_design' / 'challenge'
- *   - otherwise                    -> PROBE or CROSS_TOPIC on the next
- *     highest-signal uncovered topic (never a topic already covered,
- *     except intentional DEPTH revisits)
+ * Priority order:
+ *   1. If a FINAL_ASSESSMENT question has already been asked, signal
+ *      readyToComplete instead of proposing another question.
+ *   2. If no questions have been asked yet, open with BASELINE.
+ *   3. Otherwise, let the most recent answer evaluation's
+ *      `recommendedAction` (P6 -> P5 wiring) steer the decision:
+ *        FOLLOW_UP / CLARIFY   -> stay on the same day
+ *        INCREASE_DIFFICULTY   -> DEPTH on the same day
+ *        CHANGE_TOPIC          -> a fresh, uncovered day
+ *        CROSS_CONNECT         -> bridge to another covered day
+ *        COMPLETE              -> FINAL_ASSESSMENT, if minimums are met
+ *   4. If no evaluation exists yet, or the steer above couldn't find a
+ *      valid day (e.g. curriculum pool exhausted), fall back to
+ *      coverage-driven default: FINAL_ASSESSMENT once minimums are met,
+ *      otherwise probe the next uncovered topic.
  *
  * @param {import('./sessionModel').SessionState} session
- * @returns {QuestionDecision}
+ * @returns {object} decision — compatible with prompts.buildQuestionMessages()
  */
 function decideNextQuestion(session) {
-  if (session.phase === PHASES.COMPLETE) {
-    throw new Error('decideNextQuestion: session is already COMPLETE, nothing left to ask');
-  }
-  if (session.phase === PHASES.FINAL_ASSESSMENT) {
-    throw new Error(
-      'decideNextQuestion: session is already in FINAL_ASSESSMENT — the closing question has been asked; ' +
-      'record its answer and call sessionModel.setPhase(session, PHASES.COMPLETE) instead of asking another question.'
-    );
+  if (!session) throw new Error('decideNextQuestion: session is required');
+
+  // 1. Already asked the closing question — nothing left to decide.
+  if (countQuestionsInPhase(session, PHASES.FINAL_ASSESSMENT) >= 1) {
+    return buildReadyToCompleteDecision(session);
   }
 
-  const lastQuestion = session.questions[session.questions.length - 1] || null;
-  const lastEvaluation = session.evaluations[session.evaluations.length - 1] || null;
-  const currentDifficulty = computeCurrentDifficulty(session);
-
-  // --- Very first turn: always a low-pressure baseline warm-up. ---
-  if (session.questionsAsked === 0) {
-    const warmUp =
-      session.plannedTopics.find((t) => t.role === 'warm-up') ||
-      session.plannedTopics[0] ||
-      pickNextTopic(session);
-    const ctx = warmUp ? lookupTopicContext(session, warmUp.day) : { module: null, candidateStatus: null, attempts: null };
-    return {
-      phase: PHASES.BASELINE,
-      day: warmUp ? warmUp.day : null,
-      topic: warmUp ? warmUp.title : null,
-      module: warmUp ? (warmUp.module ?? ctx.module) : null,
-      candidateStatus: warmUp ? (warmUp.candidateStatus ?? ctx.candidateStatus ?? 'completed') : null,
-      attempts: ctx.attempts,
-      questionType: QUESTION_TYPES.BASELINE,
-      difficulty: 'foundational',
-      isFollowUp: false,
-    };
+  // 2. Very first question of the interview.
+  if (session.questions.length === 0) {
+    const baseline = buildBaselineDecision(session);
+    if (baseline) return baseline;
+    // Degenerate edge case (no candidate topics at all) — fall through
+    // to the generic probe fallback below.
   }
 
-  // Has the day just asked about already been clarified once and is STILL
-  // shallow? That's a repeated struggle — stop clarifying, move on instead
-  // of looping unproductively on the same topic.
-  const signalForLastDay = lastQuestion && lastQuestion.day !== null ? session.competencySignals.get(lastQuestion.day) : null;
-  const repeatedStruggle = Boolean(signalForLastDay && signalForLastDay.attempts >= 2 && signalForLastDay.lastShallow);
+  // 3. Let the most recent evaluation steer the decision.
+  const lastEvaluation = session.evaluations[session.evaluations.length - 1];
+  if (lastEvaluation) {
+    const lastQuestion = session.questions.find((q) => q.id === lastEvaluation.questionId);
+    const day = lastQuestion ? lastQuestion.day : null;
+    const action = lastEvaluation.recommendedAction;
 
-  // ---------------------------------------------------------------
-  // P6 hook: if the last answer was evaluated by answerEvaluator.js
-  // and carries a recommendedAction, that action drives this turn's
-  // decision directly — taking priority over the score-only heuristic
-  // below. This is the concrete mechanism by which "the evaluation
-  // influences the next question selected by P5." Falls through to the
-  // original heuristic when there's no evaluation yet, the action is
-  // missing/invalid, or the mapped action isn't applicable right now
-  // (e.g. COMPLETE requested before minimums are met).
-  // ---------------------------------------------------------------
-  if (lastEvaluation && VALID_RECOMMENDED_ACTIONS.has(lastEvaluation.recommendedAction)) {
-    const mapped = mapRecommendedActionToDecision(session, lastEvaluation.recommendedAction, {
-      lastQuestion,
-      currentDifficulty,
-      repeatedStruggle,
-      meetsMinimums: meetsCompletionCriteria(session),
-    });
-    if (mapped) return mapped;
+    let steered = null;
+    switch (action) {
+      case 'FOLLOW_UP':
+        steered = buildFollowUpDecision(session, day, { clarify: false });
+        break;
+      case 'CLARIFY':
+        steered = buildFollowUpDecision(session, day, { clarify: true });
+        break;
+      case 'INCREASE_DIFFICULTY':
+        steered = buildDepthDecision(session, day);
+        break;
+      case 'CHANGE_TOPIC':
+        // Once the interview has already cleared its minimums, opening yet
+        // another brand-new topic just prolongs things unnecessarily —
+        // wrap up instead. Below the minimums, honor the request to move on.
+        steered = sessionModel.meetsCompletionCriteria(session)
+          ? buildFinalAssessmentDecision(session)
+          : buildChangeTopicDecision(session, day);
+        break;
+      case 'CROSS_CONNECT':
+        steered = buildCrossConnectDecision(session, day) || buildChangeTopicDecision(session, day);
+        break;
+      case 'COMPLETE':
+        if (sessionModel.meetsCompletionCriteria(session)) {
+          steered = buildFinalAssessmentDecision(session);
+        }
+        break;
+      default:
+        steered = null;
+    }
+    if (steered) return steered;
   }
 
-  const lastAnswerWeak =
-    Boolean(lastEvaluation) &&
-    (lastEvaluation.shallow || (typeof lastEvaluation.score === 'number' && lastEvaluation.score <= WEAK_SCORE_THRESHOLD)) &&
-    !repeatedStruggle;
-  const lastAnswerStrong =
-    Boolean(lastEvaluation) &&
-    !lastEvaluation.shallow &&
-    typeof lastEvaluation.score === 'number' &&
-    lastEvaluation.score >= STRONG_SCORE_THRESHOLD;
-
-  const nextPhase = recommendNextPhase(session, {
-    lastAnswerShallow: lastAnswerWeak,
-    wantDepthProbe: lastAnswerStrong,
-  });
-
-  switch (nextPhase) {
-    case PHASES.FOLLOW_UP: {
-      const ctx = lookupTopicContext(session, lastQuestion.day);
-      return {
-        phase: PHASES.FOLLOW_UP,
-        day: lastQuestion.day,
-        topic: lastQuestion.title,
-        module: ctx.module,
-        candidateStatus: ctx.candidateStatus,
-        attempts: ctx.attempts,
-        questionType: QUESTION_TYPES.CLARIFICATION,
-        difficulty: stepDown(currentDifficulty),
-        isFollowUp: true,
-      };
-    }
-
-    case PHASES.CROSS_TOPIC: {
-      const next = pickNextTopic(session);
-      return {
-        phase: PHASES.CROSS_TOPIC,
-        day: next ? next.day : null,
-        topic: next ? next.title : null,
-        module: next ? next.module : null,
-        candidateStatus: next ? next.candidateStatus : null,
-        attempts: next ? next.attempts : null,
-        questionType: QUESTION_TYPES.CROSS_TOPIC,
-        // if we're moving on BECAUSE of a repeated struggle, ease off the
-        // difficulty a notch so the fresh topic isn't stacked on top of
-        // an already-rough patch of the interview.
-        difficulty: repeatedStruggle ? stepDown(currentDifficulty) : currentDifficulty,
-        isFollowUp: false,
-      };
-    }
-
-    case PHASES.DEPTH: {
-      const harder = stepUp(currentDifficulty);
-      const ctx = lookupTopicContext(session, lastQuestion.day);
-      const questionType =
-        harder === 'advanced'
-          ? QUESTION_TYPES.CHALLENGE
-          : harder === 'intermediate'
-            ? QUESTION_TYPES.SCENARIO
-            : QUESTION_TYPES.ARCHITECTURE_DESIGN;
-      return {
-        phase: PHASES.DEPTH,
-        day: lastQuestion.day,
-        topic: lastQuestion.title,
-        module: ctx.module,
-        candidateStatus: ctx.candidateStatus,
-        attempts: ctx.attempts,
-        questionType,
-        difficulty: harder,
-        isFollowUp: false,
-      };
-    }
-
-    case PHASES.FINAL_ASSESSMENT: {
-      return {
-        phase: PHASES.FINAL_ASSESSMENT,
-        day: null,
-        topic: 'Overall reflection',
-        module: null,
-        candidateStatus: null,
-        attempts: null,
-        questionType: QUESTION_TYPES.SCENARIO,
-        difficulty: currentDifficulty,
-        isFollowUp: false,
-      };
-    }
-
-    case PHASES.PROBE:
-    default: {
-      const next = pickNextTopic(session);
-      return {
-        phase: PHASES.PROBE,
-        day: next ? next.day : null,
-        topic: next ? next.title : null,
-        module: next ? next.module : null,
-        candidateStatus: next ? next.candidateStatus : null,
-        attempts: next ? next.attempts : null,
-        questionType: QUESTION_TYPES.TECHNICAL_PROBE,
-        difficulty: currentDifficulty,
-        isFollowUp: false,
-      };
-    }
+  // 4. Coverage-driven default.
+  if (sessionModel.meetsCompletionCriteria(session)) {
+    return buildFinalAssessmentDecision(session);
   }
+  const probe = buildProbeDecision(session);
+  if (probe) return probe;
+
+  // Curriculum pool is fully exhausted but minimums still aren't met —
+  // nothing left to ground a new question in. Signal readiness to wrap
+  // up anyway rather than looping forever; sessionModel's own guard will
+  // still refuse an illegal FINAL_ASSESSMENT transition if minimums
+  // truly aren't met, so this can't silently produce a too-short interview.
+  return buildFinalAssessmentDecision(session);
 }
 
 // ---------------------------------------------------------------------
-// LLM-backed phrasing
+// Public entry point #2: generateNextQuestion (decision -> LLM phrasing)
 // ---------------------------------------------------------------------
 
 /**
- * Defensive cleanup in case the model doesn't perfectly follow the
- * "output only the question" instruction — strips common preambles/
- * quote-wrapping without altering the substance of the question.
- * @param {string} raw
+ * Deterministic, content-agnostic fallback question text — used only
+ * when the LLM call fails or returns empty, so the interview keeps
+ * moving instead of crashing (same "structural safety net" philosophy
+ * as answerEvaluator.js's fallback path).
+ * @param {object} decision
  * @returns {string}
  */
-function sanitizeQuestionText(raw) {
-  let text = (raw || '').trim();
-  text = text.replace(/^(question|interviewer)\s*:\s*/i, '');
-  text = text.replace(/^here'?s (a|the) (next )?question[:.]?\s*/i, '');
-  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith('“') && text.endsWith('”'))) {
-    text = text.slice(1, -1).trim();
+function buildFallbackQuestionText(decision) {
+  if (decision.day === null || decision.day === undefined) {
+    return "Looking back at the cohort, what part are you proudest of, and why?";
   }
-  return text;
+  if (decision.isFollowUp) {
+    return `Could you say a bit more about Day ${decision.day} (${decision.topic || 'that topic'}) — specifically, how would you approach it in practice?`;
+  }
+  return `Let's talk about Day ${decision.day} (${decision.topic || 'that topic'}). Can you walk me through how you'd approach it?`;
 }
 
 /**
- * Full turn: decide what to ask (sync, deterministic), then ask the LLM
- * to phrase it (async), then return the exact structured shape required
- * by the spec.
+ * Decides the next question (via decideNextQuestion) and phrases it
+ * through the LLM, using prompts.buildQuestionMessages() — never
+ * duplicating that prompt-building logic here.
  *
  * @param {import('./sessionModel').SessionState} session
- * @param {{ completeFn?: typeof llmClient.complete }} [options] - `completeFn`
- *   is injectable so callers (and tests) can stub the LLM without a live
- *   API key; defaults to the real llmClient.
- * @returns {Promise<{ question: string, curriculumDay: number|null, topic: string|null, questionType: string, difficulty: string }>}
+ * @param {{ completeFn?: typeof llmClient.complete }} [options] - injectable,
+ *   matching the same pattern answerEvaluator.js uses for tests/dev.
+ * @returns {Promise<{
+ *   question: string|null,
+ *   phase: string,
+ *   curriculumDay: number|null,
+ *   topic: string|null,
+ *   module: string|null,
+ *   questionType: string|null,
+ *   difficulty: string,
+ *   isFollowUp: boolean,
+ *   relatedDays: number[],
+ *   rationale: string,
+ *   readyToComplete: boolean,
+ * }>}
  */
 async function generateNextQuestion(session, options = {}) {
   const decision = decideNextQuestion(session);
+
+  if (decision.readyToComplete) {
+    return {
+      question: null,
+      phase: decision.phase,
+      curriculumDay: decision.day,
+      topic: decision.topic,
+      module: decision.module,
+      questionType: decision.questionType,
+      difficulty: decision.difficulty,
+      isFollowUp: decision.isFollowUp,
+      relatedDays: decision.relatedDays,
+      rationale: decision.rationale,
+      readyToComplete: true,
+    };
+  }
+
   const messages = buildQuestionMessages(session, decision);
   const completeFn = options.completeFn || llmClient.complete;
 
-  const raw = await completeFn(messages, { maxTokens: 300, temperature: 0.7 });
-  const question = sanitizeQuestionText(raw);
+  let questionText = '';
+  try {
+    questionText = await completeFn(messages, { maxTokens: 300, temperature: 0.7 });
+  } catch (_err) {
+    questionText = ''; // LLM failure -> fall through to the deterministic fallback below
+  }
+  questionText = (questionText || '').trim();
+  if (!questionText) questionText = buildFallbackQuestionText(decision);
 
   return {
-    question,
+    question: questionText,
+    phase: decision.phase,
     curriculumDay: decision.day,
     topic: decision.topic,
+    module: decision.module,
     questionType: decision.questionType,
     difficulty: decision.difficulty,
+    isFollowUp: decision.isFollowUp,
+    relatedDays: decision.relatedDays,
+    rationale: decision.rationale,
+    readyToComplete: false,
   };
 }
 
 module.exports = {
-  QUESTION_TYPES,
-  WEAK_SCORE_THRESHOLD,
-  STRONG_SCORE_THRESHOLD,
-  computeCurrentDifficulty,
-  pickNextTopic,
-  mapRecommendedActionToDecision,
   decideNextQuestion,
+  computeCurrentDifficulty,
   generateNextQuestion,
-  sanitizeQuestionText,
+  // exported for tests / transparency
+  QUESTION_TYPE_BY_INTENT,
+  buildFallbackQuestionText,
 };

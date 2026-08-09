@@ -6,7 +6,7 @@
  * This is NOT the API — just a local smoke test of the helper functions.
  */
 
-const intel = require('../src/intelligence');
+const intel = require('../src/intellegence');
 
 const candidateId = process.argv[2] || 'CAND-002'; // Alex Turner: mix of pass/repeat/no skips
 const candidate = intel.getCandidateById(candidateId);

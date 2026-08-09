@@ -27,8 +27,8 @@
  * both satisfied.
  */
 
-const { buildCandidateProfile } = require('../intelligence/candidateProfileEngine');
-const { getRelevantCurriculumDays } = require('../intelligence/curriculumIntelligence');
+const { buildCandidateProfile } = require('../intellegence/candidateProfileEngine');
+const { getRelevantCurriculumDays } = require('../intellegence/curriculumIntelligence');
 
 /** @typedef {import('../models/types').RawCandidate} RawCandidate */
 

@@ -6,7 +6,7 @@
  * Not the API — just verifies buildCandidateProfile() against real data.
  */
 
-const intel = require('../src/intelligence');
+const intel = require('../src/intellegence');
 
 const allCandidates = intel.getAllCandidates();
 
