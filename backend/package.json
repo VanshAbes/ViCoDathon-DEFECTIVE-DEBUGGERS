@@ -1,0 +1,17 @@
+{
+  "name": "ai-interview-agent-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI Interview Agent backend — POST /api/interview per technical-spec.md",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test:engine": "node scripts/testInterviewEngine.js",
+    "test:api": "node scripts/testApi.js",
+    "test": "node scripts/testInterviewEngine.js && node scripts/testApi.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
