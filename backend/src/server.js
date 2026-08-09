@@ -164,7 +164,7 @@ function createServer() {
 if (require.main === module) {
   const server = createServer();
   const port = process.env.PORT || 3000;
-  server.listen(port, () => {
+  server.listen(port, '0.0.0.0', () => {
     // eslint-disable-next-line no-console
     console.log(`AI Interview Agent backend listening on port ${port}`);
   });
